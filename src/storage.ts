@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { chmod, link, mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -51,6 +51,32 @@ export interface WorkflowUploadMetadata {
 	description?: string | null;
 }
 
+export type JobSubmissionState = "submitting" | "accepted" | "ambiguous" | "rejected" | "cancelled";
+
+export interface JobSubmission {
+	promptId: string;
+	workflowId: string;
+	clientRequestId: string | null;
+	requestFingerprint: string;
+	metadata: Record<string, unknown>;
+	state: JobSubmissionState;
+	createdAt: number;
+	updatedAt: number;
+	upstreamError: unknown | null;
+}
+
+interface JobSubmissionRow {
+	prompt_id: string;
+	workflow_id: string;
+	client_request_id: string | null;
+	request_fingerprint: string;
+	metadata_json: string;
+	state: JobSubmissionState;
+	created_at: number;
+	updated_at: number;
+	upstream_error_json: string | null;
+}
+
 function metadataFromRow(row: WorkflowRow): WorkflowMetadata {
 	return {
 		id: row.id,
@@ -60,6 +86,20 @@ function metadataFromRow(row: WorkflowRow): WorkflowMetadata {
 		description: row.description,
 		bytes: row.bytes,
 		createdAt: row.created_at,
+	};
+}
+
+function submissionFromRow(row: JobSubmissionRow): JobSubmission {
+	return {
+		promptId: row.prompt_id,
+		workflowId: row.workflow_id,
+		clientRequestId: row.client_request_id,
+		requestFingerprint: row.request_fingerprint,
+		metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
+		state: row.state,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+		upstreamError: row.upstream_error_json === null ? null : JSON.parse(row.upstream_error_json) as unknown,
 	};
 }
 
@@ -86,6 +126,7 @@ export class HubStore {
 	readonly dataDir: string;
 	readonly stagingDir: string;
 	readonly workflowsDir: string;
+	readonly clientId: string;
 	private readonly now: () => number;
 	private readonly uploadTtlMs: number;
 	private readonly recoveryGraceMs: number;
@@ -103,7 +144,7 @@ export class HubStore {
 		this.db = new Database(join(options.dataDir, "hub.sqlite"), { create: true });
 		this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
 		const versionRow = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
-		if (versionRow.user_version > 2) throw new Error(`Hub database schema ${versionRow.user_version} is newer than this server`);
+		if (versionRow.user_version > 3) throw new Error(`Hub database schema ${versionRow.user_version} is newer than this server`);
 		const migrate = this.db.transaction(() => {
 			this.db.exec(`
 				CREATE TABLE IF NOT EXISTS staged_uploads (
@@ -134,9 +175,36 @@ export class HubStore {
 				)`);
 			}
 			this.db.exec("CREATE INDEX IF NOT EXISTS workflows_created ON workflows(created_at DESC, id DESC)");
-			this.db.exec("PRAGMA user_version = 2");
+			if (versionRow.user_version < 3) {
+				this.db.exec(`
+					CREATE TABLE job_submissions (
+						prompt_id TEXT PRIMARY KEY,
+						workflow_id TEXT NOT NULL REFERENCES workflows(id),
+						client_request_id TEXT UNIQUE,
+						request_fingerprint TEXT NOT NULL,
+						metadata_json TEXT NOT NULL,
+						state TEXT NOT NULL CHECK (state IN ('submitting', 'accepted', 'ambiguous', 'rejected', 'cancelled')),
+						created_at INTEGER NOT NULL,
+						updated_at INTEGER NOT NULL,
+						upstream_error_json TEXT
+					);
+					CREATE INDEX job_submissions_workflow_created ON job_submissions(workflow_id, created_at DESC);
+					CREATE TABLE hub_settings (
+						key TEXT PRIMARY KEY,
+						value TEXT NOT NULL
+					);
+				`);
+			}
+			this.db.exec("PRAGMA user_version = 3");
 		});
 		migrate.immediate();
+		const clientId = this.db.transaction(() => {
+			this.db.prepare("INSERT OR IGNORE INTO hub_settings(key, value) VALUES ('client_id', ?)").run(randomUUID());
+			const row = this.db.prepare("SELECT value FROM hub_settings WHERE key = 'client_id'").get() as { value: string } | null;
+			if (!row) throw new Error("Durable ComfyUI client id was not created");
+			return row.value;
+		});
+		this.clientId = clientId.immediate();
 	}
 
 	async initialize(): Promise<void> {
@@ -332,6 +400,112 @@ export class HubStore {
 	workflowCount(): number {
 		const row = this.db.prepare("SELECT COUNT(*) AS count FROM workflows").get() as { count: number };
 		return row.count;
+	}
+
+	async readWorkflowContent(id: string): Promise<{ metadata: WorkflowMetadata; workflow: Record<string, unknown>; workflowJson: string }> {
+		const metadata = this.getWorkflow(id);
+		if (!metadata) throw new HttpError(404, "workflow_not_found", "Workflow not found");
+		const path = this.workflowContentPath(id);
+		if (!path) throw new HttpError(404, "workflow_not_found", "Workflow not found");
+		let bytes: Buffer;
+		try {
+			bytes = Buffer.from(await Bun.file(path).arrayBuffer());
+		} catch {
+			throw new HttpError(500, "workflow_storage_error", "Stored workflow content is unavailable");
+		}
+		const digest = createHash("sha256").update(bytes).digest("hex");
+		if (digest !== metadata.sha256 || bytes.byteLength !== metadata.bytes) {
+			throw new HttpError(500, "workflow_storage_error", "Stored workflow content failed its integrity check");
+		}
+		let workflowJson: string;
+		let workflow: unknown;
+		try {
+			workflowJson = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+			workflow = JSON.parse(workflowJson);
+		} catch {
+			throw new HttpError(500, "workflow_storage_error", "Stored workflow content is not valid UTF-8 JSON");
+		}
+		validateApiWorkflow(workflow);
+		return { metadata, workflow, workflowJson };
+	}
+
+	beginJobSubmission(input: {
+		promptId: string;
+		workflowId: string;
+		clientRequestId: string | null;
+		requestFingerprint: string;
+		metadata: Record<string, unknown>;
+	}): { submission: JobSubmission; reused: boolean } {
+		const now = this.now();
+		const create = this.db.transaction(() => {
+			if (input.clientRequestId !== null) {
+				const existing = this.db.prepare("SELECT * FROM job_submissions WHERE client_request_id = ?")
+					.get(input.clientRequestId) as JobSubmissionRow | null;
+				if (existing) {
+					if (existing.request_fingerprint !== input.requestFingerprint) {
+						throw new HttpError(409, "idempotency_key_reused", "client_request_id was already used with a different workflow or metadata");
+					}
+					return { submission: submissionFromRow(existing), reused: true };
+				}
+			}
+			this.db.prepare(`
+				INSERT INTO job_submissions(
+					prompt_id, workflow_id, client_request_id, request_fingerprint, metadata_json,
+					state, created_at, updated_at, upstream_error_json
+				) VALUES (?, ?, ?, ?, ?, 'submitting', ?, ?, NULL)
+			`).run(
+				input.promptId,
+				input.workflowId,
+				input.clientRequestId,
+				input.requestFingerprint,
+				JSON.stringify(input.metadata),
+				now,
+				now,
+			);
+			const row = this.db.prepare("SELECT * FROM job_submissions WHERE prompt_id = ?").get(input.promptId) as JobSubmissionRow | null;
+			if (!row) throw new Error("Job submission attempt was not persisted");
+			return { submission: submissionFromRow(row), reused: false };
+		});
+		return create.immediate();
+	}
+
+	getJobSubmission(promptId: string): JobSubmission | null {
+		const row = this.db.prepare("SELECT * FROM job_submissions WHERE prompt_id = ?").get(promptId) as JobSubmissionRow | null;
+		return row ? submissionFromRow(row) : null;
+	}
+
+	listJobSubmissions(): JobSubmission[] {
+		const rows = this.db.prepare("SELECT * FROM job_submissions ORDER BY created_at DESC, prompt_id DESC").all() as JobSubmissionRow[];
+		return rows.map(submissionFromRow);
+	}
+
+	updateJobSubmission(promptId: string, state: JobSubmissionState, upstreamError: unknown | null = null): JobSubmission {
+		const now = this.now();
+		const errorJson = upstreamError === null ? null : JSON.stringify(upstreamError);
+		const result = this.db.prepare(`
+			UPDATE job_submissions SET state = ?, updated_at = ?, upstream_error_json = ? WHERE prompt_id = ?
+		`).run(state, now, errorJson, promptId);
+		if (result.changes === 0) throw new Error("Job submission attempt disappeared before it could be updated");
+		const row = this.db.prepare("SELECT * FROM job_submissions WHERE prompt_id = ?").get(promptId) as JobSubmissionRow | null;
+		if (!row) throw new Error("Updated job submission attempt could not be read");
+		return submissionFromRow(row);
+	}
+
+	markJobSubmissionAcceptedIfUnresolved(promptId: string): JobSubmission | null {
+		this.db.prepare(`
+			UPDATE job_submissions SET state = 'accepted', updated_at = ?, upstream_error_json = NULL
+			WHERE prompt_id = ? AND state IN ('submitting', 'ambiguous')
+		`).run(this.now(), promptId);
+		return this.getJobSubmission(promptId);
+	}
+
+	replaceJobSubmissionPromptId(oldPromptId: string, promptId: string): JobSubmission {
+		const update = this.db.prepare("UPDATE job_submissions SET prompt_id = ?, updated_at = ? WHERE prompt_id = ?")
+			.run(promptId, this.now(), oldPromptId);
+		if (update.changes === 0) throw new Error("Job submission attempt disappeared before its prompt id could be updated");
+		const row = this.db.prepare("SELECT * FROM job_submissions WHERE prompt_id = ?").get(promptId) as JobSubmissionRow | null;
+		if (!row) throw new Error("Job submission attempt could not be read after its prompt id was updated");
+		return submissionFromRow(row);
 	}
 
 	close(): void {

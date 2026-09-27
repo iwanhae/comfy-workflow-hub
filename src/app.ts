@@ -4,6 +4,7 @@ import type { HubConfig } from "./config.ts";
 import { isAllowedRequestHost } from "./config.ts";
 import { ComfyApiClient } from "./comfy-client.ts";
 import { ComfyUpstreamError, HttpError } from "./errors.ts";
+import { JobService } from "./jobs.ts";
 import { streamMultipartFile } from "./multipart.ts";
 import { HubStore } from "./storage.ts";
 
@@ -16,8 +17,8 @@ function jsonResponse(value: unknown, status = 200, headers?: Headers | Record<s
 	return new Response(JSON.stringify(value), { status, headers: responseHeaders });
 }
 
-function errorResponse(status: number, code: string, message: string): Response {
-	return jsonResponse({ error: { code, message } }, status);
+function errorResponse(status: number, code: string, message: string, details?: unknown): Response {
+	return jsonResponse({ error: { code, message, ...(details !== undefined ? { details } : {}) } }, status);
 }
 
 async function readJsonBody(request: Request): Promise<unknown> {
@@ -69,6 +70,40 @@ function parseMetadata(value: unknown): { uploadId: string; name?: string | null
 	return { uploadId: body.upload_id, ...(name !== undefined ? { name } : {}), ...(description !== undefined ? { description } : {}) };
 }
 
+function parseJobSubmission(value: unknown): { workflowId: string; metadata: Record<string, unknown>; clientRequestId: string | null } {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new HttpError(400, "invalid_request", "Request body must be an object");
+	}
+	const body = value as Record<string, unknown>;
+	for (const key of Object.keys(body)) {
+		if (!["workflow_id", "metadata", "client_request_id"].includes(key)) {
+			throw new HttpError(400, "invalid_request", `Unknown field: ${key}`);
+		}
+	}
+	if (typeof body.workflow_id !== "string" || !/^[a-f0-9]{64}$/.test(body.workflow_id)) {
+		throw new HttpError(400, "invalid_workflow_id", "workflow_id must be a stored workflow SHA-256 id");
+	}
+	let metadata: Record<string, unknown> = {};
+	if (body.metadata !== undefined) {
+		if (!body.metadata || typeof body.metadata !== "object" || Array.isArray(body.metadata)) {
+			throw new HttpError(400, "invalid_metadata", "metadata must be a JSON object");
+		}
+		metadata = body.metadata as Record<string, unknown>;
+		if (JSON.stringify(metadata).length > JSON_BODY_LIMIT - 1024) {
+			throw new HttpError(413, "metadata_too_large", "metadata exceeds the request size limit");
+		}
+	}
+	let clientRequestId: string | null = null;
+	if (body.client_request_id !== undefined) {
+		if (typeof body.client_request_id !== "string" || body.client_request_id.length < 1 || body.client_request_id.length > 256 || /[\u0000-\u001f\u007f]/.test(body.client_request_id)) {
+			throw new HttpError(400, "invalid_client_request_id", "client_request_id must be printable text up to 256 characters");
+		}
+		clientRequestId = body.client_request_id.trim();
+		if (!clientRequestId) throw new HttpError(400, "invalid_client_request_id", "client_request_id cannot be empty");
+	}
+	return { workflowId: body.workflow_id, metadata, clientRequestId };
+}
+
 function parseOptionalText(value: unknown, field: string, maxLength: number): string | null | undefined {
 	if (value === undefined) return undefined;
 	if (value === null) return null;
@@ -88,6 +123,26 @@ function parsePositiveQuery(value: string | null, fallback: number, max: number,
 	return parsed;
 }
 
+function parseOffsetQuery(value: string | null, field = "offset"): number {
+	const raw = value ?? "0";
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+		throw new HttpError(400, "invalid_query", `${field} must be a non-negative integer`);
+	}
+	return Number(raw);
+}
+
+function parseWaitTimeout(value: string | null): number {
+	if (value === null) return 30_000;
+	if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value)) {
+		throw new HttpError(400, "invalid_query", "timeout must be a number of seconds between 0 and 300");
+	}
+	const seconds = Number(value);
+	if (!Number.isFinite(seconds) || seconds < 0 || seconds > 300) {
+		throw new HttpError(400, "invalid_query", "timeout must be a number of seconds between 0 and 300");
+	}
+	return seconds * 1000;
+}
+
 function decodePathSegment(value: string): string {
 	try {
 		const decoded = decodeURIComponent(value);
@@ -104,6 +159,14 @@ function decodeComfyId(value: string): string {
 	const id = decodePathSegment(value);
 	if (id.length > 512 || /[\u0000-\u001f\u007f]/.test(id)) {
 		throw new HttpError(400, "invalid_path", "Invalid ComfyUI job id");
+	}
+	return id;
+}
+
+function decodeJobId(value: string): string {
+	const id = decodePathSegment(value);
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+		throw new HttpError(400, "invalid_job_id", "job id must be a canonical lowercase UUID");
 	}
 	return id;
 }
@@ -129,11 +192,19 @@ export interface HubAppOptions {
 	config: HubConfig;
 	store: HubStore;
 	comfy: ComfyApiClient;
+	jobs?: JobService;
 }
 
-export function createHubApp({ config, store, comfy }: HubAppOptions): { fetch: (request: Request) => Promise<Response> } {
+export interface HubRequestServer {
+	timeout(request: Request, seconds: number): void;
+}
+
+export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAppOptions): {
+	fetch: (request: Request, server?: HubRequestServer) => Promise<Response>;
+} {
+	const jobs = suppliedJobs ?? new JobService({ store, comfy });
 	return {
-		async fetch(request: Request): Promise<Response> {
+		async fetch(request: Request, server?: HubRequestServer): Promise<Response> {
 			try {
 				const url = new URL(request.url);
 				const path = url.pathname;
@@ -175,6 +246,37 @@ export function createHubApp({ config, store, comfy }: HubAppOptions): { fetch: 
 					const data = parseMetadata(await readJsonBody(request));
 					const workflow = await store.workflowUpload(data.uploadId, data, config.maxWorkflowBytes);
 					return jsonResponse(workflow, 201, { etag: `"${workflow.sha256}"` });
+				}
+
+				if (request.method === "POST" && path === "/api/v1/jobs") {
+					const input = parseJobSubmission(await readJsonBody(request));
+					const result = await jobs.submit(input, request.signal);
+					return jsonResponse(result, result.reused ? 200 : result.status === "submission_unknown" ? 202 : 201);
+				}
+
+				if (request.method === "GET" && path === "/api/v1/jobs") {
+					const limit = parsePositiveQuery(url.searchParams.get("limit"), 50, 100, "limit");
+					const offset = parseOffsetQuery(url.searchParams.get("offset"));
+					return jsonResponse(await jobs.list({ limit, offset, signal: request.signal }));
+				}
+
+				const hubJobMatch = /^\/api\/v1\/jobs\/([^/]+)(?:\/(wait|cancel))?$/.exec(path);
+				if (hubJobMatch) {
+					const jobId = decodeJobId(hubJobMatch[1]!);
+					const action = hubJobMatch[2];
+					if (!action && request.method === "GET") return jsonResponse(await jobs.get(jobId, request.signal));
+					if (action === "wait" && request.method === "GET") {
+						// Bun's default idleTimeout includes time spent awaiting a handler.
+						// Disable it only for this wait request; the caller's abort signal
+						// still stops polling without touching the upstream job.
+						server?.timeout(request, 0);
+						const timeoutMs = parseWaitTimeout(url.searchParams.get("timeout"));
+						return jsonResponse(await jobs.wait(jobId, timeoutMs, request.signal));
+					}
+					if (action === "cancel" && request.method === "POST") {
+						const result = await jobs.cancel(jobId, request.signal);
+						return jsonResponse(result, result.outcome === "unknown" ? 202 : 200);
+					}
 				}
 
 				if (request.method === "GET" && path === "/api/v1/workflows") {
@@ -229,7 +331,8 @@ export function createHubApp({ config, store, comfy }: HubAppOptions): { fetch: 
 
 				throw new HttpError(404, "not_found", "Route not found");
 			} catch (error) {
-				if (error instanceof HttpError) return errorResponse(error.status, error.code, error.message);
+				if (request.signal.aborted) return new Response(null, { status: 499 });
+				if (error instanceof HttpError) return errorResponse(error.status, error.code, error.message, error.details);
 				if (error instanceof ComfyUpstreamError) {
 					const status = error.status === 504 ? 504 : 502;
 					return errorResponse(status, "comfy_upstream_error", error.message);

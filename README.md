@@ -1,9 +1,9 @@
-# Comfy workflow hub (milestone 1)
+# Comfy workflow hub
 
-A small Bun/TypeScript service for sharing immutable ComfyUI API-format workflows
-and read-only ComfyUI discovery across agents. It stores records locally in
-SQLite and content-addressed files under `DATA_DIR` (default: `./data`). This
-milestone does not submit workflows to ComfyUI.
+A Bun/TypeScript service for sharing immutable ComfyUI API-format workflows,
+proxying discovery, and durably submitting/tracking ComfyUI jobs. SQLite records
+live under `DATA_DIR` (default: `./data`) and workflow bytes are content-addressed.
+Job execution uses ComfyUI's REST API; MCP, UI, and asset promotion are later work.
 
 ## Run and test
 
@@ -33,29 +33,32 @@ Environment settings:
 | `HUB_HOST` | `127.0.0.1` | Hub bind address |
 | `HUB_PORT` | `3000` | Hub HTTP port |
 | `HUB_ALLOW_LAN` | `false` | Required to bind the hub on a trusted private LAN (`0.0.0.0` or a private IP) |
-| `COMFY_BASE_URL` | `http://127.0.0.1:8188` | Read-only ComfyUI upstream origin |
+| `COMFY_BASE_URL` | `http://127.0.0.1:8188` | ComfyUI upstream origin for discovery and jobs |
 | `COMFY_ALLOW_LAN` | `false` | Required for a private-LAN ComfyUI upstream |
 | `MAX_UPLOAD_BYTES` | `52428800` | Maximum staged multipart file size (50 MiB) |
 | `MAX_WORKFLOW_BYTES` | `10485760` | Maximum workflow JSON size (10 MiB; cannot exceed upload limit) |
 | `UPLOAD_TTL_SECONDS` | `900` | One-time staged upload lifetime |
-| `COMFY_TIMEOUT_MS` | `30000` | Read-only upstream request timeout |
+| `COMFY_TIMEOUT_MS` | `30000` | Per-request ComfyUI upstream timeout (including submit/cancel) |
 
 For a trusted LAN ComfyUI at `192.168.0.2:8188`, explicitly set
 `COMFY_BASE_URL=http://192.168.0.2:8188` and `COMFY_ALLOW_LAN=true`. For other
 agents on the LAN to reach this hub, also bind it explicitly, e.g.
 `HUB_HOST=0.0.0.0` and `HUB_ALLOW_LAN=true`. **The hub has no authentication**:
-any client that can reach a LAN-exposed instance can upload, list, and read
-workflows. Use only on a trusted network and apply network-level restrictions.
+any client that can reach a LAN-exposed instance can upload/read workflows,
+submit jobs, and dequeue pending jobs. Use only on a trusted network and apply
+network-level restrictions.
 No CORS is enabled; browser state-changing requests are same-origin checked.
 Public upstream hosts and public hub bind addresses are rejected.
 
 ## HTTP API
 
-All routes are under `/api/v1`. The upload flow is intentionally two-step:
+Versioned hub routes are under `/api/v1` (`/health` is the liveness exception).
+The upload flow is intentionally two-step:
 multipart bytes are streamed to disk under a short-lived one-time `upload_id`,
 then `POST /workflows` atomically claims that ID, validates the staged bytes as
-ComfyUI API-format JSON, and commits the immutable workflow. It does not upload
-the workflow to ComfyUI.
+ComfyUI API-format JSON, and commits the immutable workflow. Job submission
+references that stored `workflow_id`; clients cannot submit arbitrary inline
+workflow JSON through the hub.
 
 ```sh
 # Stage a workflow file on this hub. Only the `file` multipart field is accepted.
@@ -69,6 +72,16 @@ curl -X POST http://127.0.0.1:3000/api/v1/workflows \
 curl http://127.0.0.1:3000/api/v1/workflows
 curl http://127.0.0.1:3000/api/v1/workflows/<sha256-id>
 curl http://127.0.0.1:3000/api/v1/workflows/<sha256-id>/content
+
+# Submit the immutable workflow, optionally with metadata and a retry-safe request key.
+curl -X POST http://127.0.0.1:3000/api/v1/jobs \
+  -H 'content-type: application/json' \
+  -d '{"workflow_id":"<sha256-id>","metadata":{"source":"agent"},"client_request_id":"run-42"}'
+
+curl 'http://127.0.0.1:3000/api/v1/jobs?limit=50&offset=0'
+curl http://127.0.0.1:3000/api/v1/jobs/<job-uuid>
+curl 'http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/wait?timeout=300'
+curl -X POST http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/cancel
 ```
 
 | Method and route | Result |
@@ -80,6 +93,11 @@ curl http://127.0.0.1:3000/api/v1/workflows/<sha256-id>/content
 | `GET /api/v1/workflows?limit=50&offset=0` | Workflow metadata page |
 | `GET /api/v1/workflows/:sha256` | Metadata plus parsed workflow object |
 | `GET /api/v1/workflows/:sha256/content` | Original workflow JSON bytes unchanged, with SHA-256 ETag |
+| `POST /api/v1/jobs` | Submit `{"workflow_id":"<sha256>","metadata?":{},"client_request_id?":"..."}`; metadata stays local |
+| `GET /api/v1/jobs?limit=50&offset=0` | Merge every paginated ComfyUI job with hub workflow mappings |
+| `GET /api/v1/jobs/:uuid` | Current ComfyUI job, including execution errors and outputs |
+| `GET /api/v1/jobs/:uuid/wait?timeout=30` | Poll up to 300 seconds; returns the latest job plus `wait_timed_out` |
+| `POST /api/v1/jobs/:uuid/cancel` | Remove only a pending job; running jobs are never interrupted; uncertain results return `202` |
 | `GET /api/v1/comfy/nodes` | ComfyUI `GET /object_info` |
 | `GET /api/v1/comfy/models` | ComfyUI `GET /models` |
 | `GET /api/v1/comfy/models/:folder` | ComfyUI `GET /models/:folder` |
@@ -88,6 +106,70 @@ curl http://127.0.0.1:3000/api/v1/workflows/<sha256-id>/content
 | `GET /api/v1/comfy/jobs/:id` | ComfyUI `GET /api/jobs/:id` |
 | `GET /api/v1/comfy/queue` | ComfyUI `GET /queue` |
 | `GET /api/v1/comfy/history/:id` | ComfyUI `GET /history/:id` |
+
+Job submission creates a canonical UUID and persists the attempt in SQLite
+*before* the single upstream `POST /prompt`. The same durable hub `client_id` is
+used for every submission (and is reserved for the future hub WebSocket). The
+stored workflow is integrity-checked, validated, and embedded verbatim as the
+`prompt` JSON value (not parsed and re-serialized), without graph edits.
+Optional request metadata is retained in the local SQLite attempt record and is
+not forwarded to ComfyUI. The only hub attribution in ComfyUI `extra_data` is
+the scalar `comfy_hub_workflow_id`; the hub does not write or alter
+`extra_pnginfo.workflow`, which ComfyUI uses for authoring-workflow metadata.
+
+Pass `client_request_id` to make concurrent/retried calls idempotent. Reusing a
+key with a different workflow or metadata is `409 idempotency_key_reused`. A
+ComfyUI `400` prompt validation response is recorded and returned as
+`422 prompt_rejected`; a timeout, network error, unexpected response, or server
+error is **ambiguous**, recorded against its known UUID, and returned as `202`
+with `status: "submission_unknown"`. The hub never retries `POST /prompt`
+automatically. Repeating a call with the same request key returns the recorded
+attempt rather than submitting again. Reconcile an ambiguous attempt with
+`GET /api/v1/jobs/:uuid` or the list; if ComfyUI has not accepted it, the hub
+still will not resubmit it behind your back.
+
+### ComfyUI job response shapes
+
+The hub targets ComfyUI 0.37.0's v1 job REST surface and preserves its job
+records and status names, adding the hub's workflow mapping and wait metadata.
+A live `GET /api/jobs` page has this shape:
+
+```json
+{
+  "jobs": [{ "id": "<uuid>", "status": "pending", "create_time": 1720000000000 }],
+  "pagination": { "offset": 0, "limit": 100, "total": 1, "has_more": false }
+}
+```
+
+ComfyUI job statuses are `pending`, `in_progress`, `completed`, `failed`, and
+`cancelled`. Pending/running records include the id, priority, create time, and
+output counts; completed records additionally carry output summaries. The
+single-job endpoint includes full `outputs`, `execution_status`, and (on
+failure) `execution_error`. The hub follows `has_more` across all pages, then
+adds its local `workflow_id` mapping; externally submitted ComfyUI jobs remain
+visible. If `/api/jobs/:id` misses a job, the hub checks the corresponding
+`/history/:id` and `/queue` records before returning not found.
+
+An attempt that was persisted but cannot yet be found upstream is returned with
+hub-only `status: "submission_unknown"` and `local_submission_state`; a stored
+validation rejection uses `submission_rejected`. A wait timeout is not an error:
+the response is the most recent snapshot with `wait_timed_out: true`. The wait
+query accepts 0–300 seconds (default 30). It does not cancel the upstream job.
+Bun's normal idle timeout would close a quiet long-poll, so the hub disables the
+idle timeout for only that wait request; disconnecting the caller aborts its
+polling without cancelling the job.
+
+Cancellation first reads the job and only asks ComfyUI to run
+`POST /queue` with `{"delete":["<uuid>"]}` when its status is `pending`. The
+queue deletion is safe if the job races into execution: it then removes nothing,
+and the hub never calls the state-agnostic `/api/jobs/:id/cancel` or global
+`/interrupt` endpoints. A race that starts the job is reported as
+`cancelled: false` with its observed status. If the `/queue` POST fails and
+subsequent reads cannot determine whether the pending job remains, the route
+returns HTTP `202` with `outcome: "unknown"`, `cancelled: null`, and
+`error.code: "cancel_outcome_unknown"`. It does not mark the local attempt
+cancelled or claim success. A follow-up read error instead returns the normal
+upstream diagnostic error.
 
 API-format validation checks the graph envelope and each node's `class_type`
 and `inputs`; it does not perform server-side semantic validation or execute
@@ -103,20 +185,20 @@ filename because it was not retained previously.
 Multipart file data is written incrementally to a generated path in `staging/`
 with a size limit and streaming digest. Filenames are metadata only; they are
 never used as paths. The service supports staging arbitrary file bytes so a
-later milestone can add image/mask assets, but this milestone only promotes
-validated workflow JSON into the immutable workflow library.
+later milestone can add image/mask assets; only validated workflow JSON is
+promoted into the immutable workflow library in this milestone.
 
-The ComfyUI client only issues the documented GET requests above. There are no
-job submission, cancellation, workflow-upload-to-Comfy, or other write routes
-in this milestone. Tests use mocked Comfy HTTP; they do not make network calls.
-MCP integration, React UI, and asset promotion are later milestones.
+The ComfyUI client has typed, bounded-timeout v1 job methods and makes no
+automatic POST retries. Tests use mocked Comfy HTTP and do not make network
+calls or generate media. Workflow file uploads to ComfyUI, MCP integration,
+React UI, and asset promotion are outside this milestone.
 
 ## Existing smoke runner
 
 The original `index.ts` and `workflows/t2i.json` are preserved unchanged. The
 existing `bun run start` command still runs that SDK smoke script, which
 submits a workflow to its configured Comfy host and downloads outputs into
-`outputs/`. **Use `bun run hub` for the new read-only hub service.** The smoke
+`outputs/`. **Use `bun run hub` for the hub service.** The smoke
 runner's `COMFY_BASE_URL` behavior remains separate from the hub's safe
 loopback default; it defaults to `https://comfy.iwanhae.kr` when the variable
 is unset.

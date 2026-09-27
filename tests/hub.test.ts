@@ -294,12 +294,43 @@ describe("workflow staging and immutable storage", () => {
 		const migrated = new HubStore({ dataDir: legacyDir, uploadTtlMs: config.uploadTtlMs });
 		expect(migrated.getWorkflow(digest)?.name).toBe("Legacy");
 		expect(migrated.getWorkflow(digest)?.filename).toBeNull();
-		expect((migrated.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
+		expect((migrated.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+		migrated.close();
+	});
+
+	test("migrates the milestone 1 schema to durable jobs without changing stored workflow rows", async () => {
+		const legacyDir = join(root, "milestone-1");
+		await mkdir(legacyDir, { recursive: true });
+		const legacyDb = new Database(join(legacyDir, "hub.sqlite"), { create: true });
+		legacyDb.exec(`
+			CREATE TABLE workflows (
+				id TEXT PRIMARY KEY,
+				sha256 TEXT NOT NULL UNIQUE,
+				original_filename TEXT NOT NULL,
+				name TEXT,
+				description TEXT,
+				bytes INTEGER NOT NULL CHECK (bytes > 0),
+				created_at INTEGER NOT NULL
+			);
+			PRAGMA user_version = 2;
+		`);
+		const digest = createHash("sha256").update(validWorkflow).digest("hex");
+		legacyDb.prepare(`
+			INSERT INTO workflows(id, sha256, original_filename, name, description, bytes, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`).run(digest, digest, "persisted.json", "Persisted", null, validWorkflow.length, Date.now());
+		legacyDb.close();
+
+		const migrated = new HubStore({ dataDir: legacyDir, uploadTtlMs: config.uploadTtlMs });
+		expect(migrated.getWorkflow(digest)?.filename).toBe("persisted.json");
+		expect((migrated.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+		expect(migrated.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'job_submissions'").get()).toBeTruthy();
+		expect(migrated.clientId).toMatch(/^[0-9a-f-]{36}$/);
 		migrated.close();
 	});
 });
 
-describe("HTTP boundaries and Comfy read-only proxy", () => {
+describe("HTTP boundaries and Comfy proxy", () => {
 	test("accepts multipart delimiters split across one-byte chunks", async () => {
 		const response = await app.fetch(multipartRequest(validWorkflow, { chunkSize: 1 }));
 		expect(response.status).toBe(201);
