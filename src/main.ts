@@ -21,9 +21,24 @@ const expirySweep = setInterval(() => {
 console.log(`Comfy workflow hub listening at ${server.url}`);
 console.log(`Persistent data directory: ${config.dataDir}`);
 
-process.on("SIGINT", () => {
+let shuttingDown = false;
+const shutdown = () => {
+	if (shuttingDown) return;
+	shuttingDown = true;
 	clearInterval(expirySweep);
 	server.stop(true);
-	store.close();
-	process.exit(0);
-});
+	void app.close().then(
+		() => {
+			store.close();
+			process.exit(0);
+		},
+		(error) => {
+			console.error("Could not finish output archive shutdown:", error);
+			store.close();
+			process.exit(1);
+		},
+	);
+};
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

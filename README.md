@@ -124,7 +124,7 @@ curl -X POST http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/cancel
 | `POST /api/v1/jobs` | Submit `{"workflow_id":"<sha256>","metadata?":{},"client_request_id?":"..."}`; metadata stays local |
 | `GET /api/v1/jobs?limit=50&offset=0` | Merge every paginated ComfyUI job with hub workflow mappings |
 | `GET /api/v1/jobs/:uuid` | Current ComfyUI job, including execution errors and outputs |
-| `GET /api/v1/jobs/:uuid/wait?timeout=30` | Poll up to 300 seconds; returns the latest job plus `wait_timed_out` |
+| `GET /api/v1/jobs/:uuid/wait?timeout=300` | Poll up to 300 seconds (the default); returns the latest job plus `wait_timed_out` |
 | `POST /api/v1/jobs/:uuid/cancel` | Remove only a pending job; running jobs are never interrupted; uncertain results return `202` |
 | `GET /api/v1/comfy/nodes` | ComfyUI `GET /object_info` |
 | `GET /api/v1/comfy/models` | ComfyUI `GET /models` |
@@ -134,6 +134,56 @@ curl -X POST http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/cancel
 | `GET /api/v1/comfy/jobs/:id` | ComfyUI `GET /api/jobs/:id` |
 | `GET /api/v1/comfy/queue` | ComfyUI `GET /queue` |
 | `GET /api/v1/comfy/history/:id` | ComfyUI `GET /history/:id` |
+
+## Remote MCP
+
+The hub also exposes an MCP Streamable HTTP endpoint at `POST /mcp` using
+`@modelcontextprotocol/server` 2.1.0. It has no authentication, just like the
+REST API: it is loopback-only by default, and exposing it to a trusted private
+LAN requires `HUB_ALLOW_LAN=true` plus a non-loopback bind. Requests are checked
+against the allowed Host and, when present, Origin; no CORS access is granted.
+Do not expose this unauthenticated service to an untrusted network.
+
+The MCP server advertises exactly these tools:
+
+```text
+node_list, node_get, model_list, model_get, model_guide,
+workflow_upload, workflow_list, workflow_get,
+job_submit, job_list, job_get, job_wait, job_cancel,
+asset_upload, asset_list, asset_get, server_get
+```
+
+Node/model discovery reads the connected ComfyUI's live `/object_info` and
+`/models/{folder}` catalogs. Lists are searched and paginated; full node schemas
+and installed-model loader choices are available through detail tools. Catalog
+responses are shared with REST and cached briefly (15 seconds). `model_guide`
+is a versioned curated record (`src/model-guides.ts`, version `1.0.0`) sourced
+only from `workflows/t2i.json`: it reports the declared Qwen Image 2.1
+diffusion-model, encoder, VAE, wiring, and workflow parameters, then checks each
+file against its expected model folder and live loader choice. A same-named file
+in another folder is reported but is not marked installed. Unknown models return
+`status: "not_available"`; no recommendations are inferred.
+
+MCP tools do not have access to a remote client's local filesystem. To upload a
+workflow or image, first send its bytes out-of-band to `POST /api/v1/uploads`
+as multipart field `file`, then pass the returned `upload_id` to
+`workflow_upload` or `asset_upload`. `workflow_upload` commits validated
+API-format workflows; `job_submit` accepts only a stored `workflow_id`, never
+inline graph JSON. `asset_get` and `asset_list` return the same stable,
+same-origin `/api/v1/assets/:id/content` URL as REST when local bytes are ready.
+`job_wait` accepts 0–300 seconds (default 300), returns the latest job status on
+timeout, and a disconnected MCP client only aborts that tool's polling; it does
+not interrupt the ComfyUI job.
+
+For UI clients, matching REST discovery endpoints share the MCP implementation:
+
+```sh
+curl 'http://127.0.0.1:3000/api/v1/comfy/nodes/search?q=sampler&limit=20'
+curl http://127.0.0.1:3000/api/v1/comfy/nodes/KSampler
+curl 'http://127.0.0.1:3000/api/v1/comfy/models/search?q=qwen&limit=20'
+curl http://127.0.0.1:3000/api/v1/comfy/models/diffusion_models/qwen_image_2.1_int8_convrot.safetensors
+curl http://127.0.0.1:3000/api/v1/comfy/model-guide/qwen-image-2.1
+```
 
 Job submission creates a canonical UUID and persists the attempt in SQLite
 *before* the single upstream `POST /prompt`. The same durable hub `client_id` is
@@ -182,7 +232,7 @@ An attempt that was persisted but cannot yet be found upstream is returned with
 hub-only `status: "submission_unknown"` and `local_submission_state`; a stored
 validation rejection uses `submission_rejected`. A wait timeout is not an error:
 the response is the most recent snapshot with `wait_timed_out: true`. The wait
-query accepts 0–300 seconds (default 30). It does not cancel the upstream job.
+query accepts 0–300 seconds (default 300). It does not cancel the upstream job.
 Bun's normal idle timeout would close a quiet long-poll, so the hub disables the
 idle timeout for only that wait request; disconnecting the caller aborts its
 polling without cancelling the job.
@@ -244,8 +294,7 @@ separate from transfer idle timeout: long downloads may run beyond
 The ComfyUI client has typed, bounded-timeout v1 job methods and makes no
 automatic POST retries. Input asset uploads are streamed to `/upload/image` or
 `/upload/mask`; ambiguous outcomes are never automatically retried. Tests use
-mocked Comfy HTTP and do not make live uploads or generate media. MCP
-integration and the React UI are outside this milestone.
+mocked Comfy HTTP and do not make live uploads or generate media.
 
 ## Existing smoke runner
 

@@ -311,6 +311,55 @@ export class AssetService {
 	}
 }
 
+/** The shared REST/MCP representation for an asset, including a same-origin download URL. */
+export async function assetResponse(asset: AssetMetadata, request: Request, store: HubStore): Promise<Record<string, unknown>> {
+	const contentPath = store.assetContentPath(asset);
+	let contentAvailable = false;
+	let status = asset.status;
+	if (contentPath) {
+		try {
+			const info = await stat(contentPath);
+			contentAvailable = info.isFile() && info.size === asset.bytes
+				&& (asset.origin === "input" || asset.status === "ready");
+		} catch {
+			contentAvailable = false;
+		}
+	}
+	if (asset.origin === "output" && asset.status === "ready" && !contentAvailable) status = "pending";
+	const workflowValue = asset.origin === "input" && status === "ready" && asset.comfyFilename !== null
+		? asset.comfySubfolder ? `${asset.comfySubfolder}/${asset.comfyFilename}` : asset.comfyFilename
+		: null;
+	const contentUrl = contentAvailable
+		? new URL(`/api/v1/assets/${encodeURIComponent(asset.id)}/content`, new URL(request.url).origin).toString()
+		: null;
+	return {
+		asset_id: asset.id,
+		kind: asset.kind,
+		origin: asset.origin,
+		status,
+		sha256: asset.sha256,
+		bytes: asset.bytes,
+		content_type: asset.contentType,
+		original_filename: asset.originalFilename,
+		original_asset_id: asset.originalAssetId,
+		filename: asset.comfyFilename ?? asset.originalFilename,
+		subfolder: asset.comfySubfolder,
+		type: asset.comfyType,
+		comfy: asset.comfyFilename === null ? null : {
+			filename: asset.comfyFilename,
+			subfolder: asset.comfySubfolder,
+			type: asset.comfyType,
+		},
+		workflow_value: workflowValue,
+		job_id: asset.jobId,
+		node_id: asset.nodeId,
+		output_key: asset.outputKey,
+		download_url: contentUrl,
+		created_at: new Date(asset.createdAt).toISOString(),
+		updated_at: new Date(asset.updatedAt).toISOString(),
+	};
+}
+
 export function discoverOutputFiles(outputs: unknown): DiscoveredOutput[] {
 	if (!isRecord(outputs)) return [];
 	const discovered: DiscoveredOutput[] = [];

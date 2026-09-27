@@ -20,6 +20,15 @@ function client(fetchImpl: FetchLike): ComfyApiClient {
 	return new ComfyApiClient({ baseUrl: new URL(baseUrl), timeoutMs: 500, fetchImpl });
 }
 
+class RecordingJobService extends JobService {
+	waitTimeouts: number[] = [];
+
+	override wait(...args: Parameters<JobService["wait"]>): ReturnType<JobService["wait"]> {
+		this.waitTimeouts.push(args[1]);
+		return super.wait(...args);
+	}
+}
+
 function response(value: unknown, status = 200): Response {
 	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
@@ -344,6 +353,26 @@ describe("durable ComfyUI job execution", () => {
 		const timedOut = await timeoutApp.fetch(getRequest(`/api/v1/jobs/${latestId}/wait?timeout=0`));
 		const latestSnapshot = await timedOut.json() as { status: string; execution_start_time: number; wait_timed_out: boolean };
 		expect(latestSnapshot).toMatchObject({ status: "in_progress", execution_start_time: 123, wait_timed_out: true });
+	});
+
+	test("REST wait defaults to five minutes while terminal jobs still return immediately", async () => {
+		const promptId = randomUUID();
+		const comfy = client(async (input) => {
+			const path = new URL(String(input)).pathname;
+			if (path === `/api/jobs/${promptId}`) return response({ id: promptId, status: "completed", outputs: {} });
+			if (path === `/history/${promptId}`) return response({});
+			throw new Error(`Unexpected upstream request: ${path}`);
+		});
+		const jobs = new RecordingJobService({ store, comfy, pollIntervalMs: 1 });
+		const app = createHubApp({ config, store, comfy, jobs });
+		const timeoutCalls: number[] = [];
+		const result = await app.fetch(getRequest(`/api/v1/jobs/${promptId}/wait`), {
+			timeout(_request, seconds) { timeoutCalls.push(seconds); },
+		});
+		expect(result.status).toBe(200);
+		expect(jobs.waitTimeouts).toEqual([300_000]);
+		expect(await result.json()).toMatchObject({ id: promptId, status: "completed", wait_timed_out: false });
+		expect(timeoutCalls).toEqual([0]);
 	});
 
 	test("an aborted wait stops polling only and never sends an upstream cancellation", async () => {

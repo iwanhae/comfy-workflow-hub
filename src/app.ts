@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { stat, unlink } from "node:fs/promises";
 import type { HubConfig } from "./config.ts";
 import { isAllowedRequestHost } from "./config.ts";
-import { AssetService } from "./assets.ts";
+import { AssetService, assetResponse } from "./assets.ts";
 import { ComfyApiClient } from "./comfy-client.ts";
+import { ComfyDiscovery } from "./discovery.ts";
 import { ComfyUpstreamError, HttpError } from "./errors.ts";
 import { JobService } from "./jobs.ts";
+import { createHubMcpHandler } from "./mcp.ts";
 import { streamMultipartFile } from "./multipart.ts";
 import { type AssetMetadata, HubStore } from "./storage.ts";
 
@@ -163,7 +165,7 @@ function parseOffsetQuery(value: string | null, field = "offset"): number {
 }
 
 function parseWaitTimeout(value: string | null): number {
-	if (value === null) return 30_000;
+	if (value === null) return 300_000;
 	if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value)) {
 		throw new HttpError(400, "invalid_query", "timeout must be a number of seconds between 0 and 300");
 	}
@@ -219,6 +221,71 @@ function guardRequest(request: Request, allowLan: boolean, isMutation: boolean):
 	}
 }
 
+function guardMcpRequest(request: Request, allowLan: boolean): void {
+	const url = new URL(request.url);
+	const host = request.headers.get("host");
+	if (!host?.trim()) throw new HttpError(403, "host_not_allowed", "MCP Host header is required");
+	try {
+		const hostUrl = new URL(`${url.protocol}//${host}`);
+		if (hostUrl.username || hostUrl.password || hostUrl.pathname !== "/" || hostUrl.search || hostUrl.hash || hostUrl.origin !== url.origin) {
+			throw new Error("host mismatch");
+		}
+	} catch {
+		throw new HttpError(403, "host_not_allowed", "MCP Host header must match the request origin");
+	}
+	if (!isAllowedRequestHost(url.hostname, allowLan)) {
+		throw new HttpError(403, "host_not_allowed", "MCP Host must be loopback or an explicitly enabled private-LAN address");
+	}
+	const origin = request.headers.get("origin");
+	if (origin !== null) {
+		try {
+			if (new URL(origin).origin !== url.origin) throw new Error("origin mismatch");
+		} catch {
+			throw new HttpError(403, "origin_not_allowed", "Cross-origin MCP requests are not allowed");
+		}
+	}
+}
+
+async function isMcpJobWaitRequest(request: Request): Promise<boolean> {
+	if (request.method !== "POST" || !request.body) return false;
+	const length = Number(request.headers.get("content-length"));
+	if (Number.isFinite(length) && length > 64 * 1024) return false;
+	const reader = request.clone().body?.getReader();
+	if (!reader) return false;
+	const chunks: Uint8Array[] = [];
+	let size = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			if (size > 64 * 1024) {
+				await reader.cancel("MCP body inspection limit reached").catch(() => undefined);
+				return false;
+			}
+			chunks.push(value);
+		}
+	} catch {
+		return false;
+	} finally {
+		reader.releaseLock();
+	}
+	try {
+		const body = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), size).toString("utf8")) as unknown;
+		const requests = Array.isArray(body) ? body : [body];
+		return requests.some((item) => isRecord(item)
+			&& item.method === "tools/call"
+			&& isRecord(item.params)
+			&& item.params.name === "job_wait");
+	} catch {
+		return false;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export interface HubAppOptions {
 	config: HubConfig;
 	store: HubStore;
@@ -245,14 +312,24 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 	const jobs = suppliedJobs ?? new JobService({ store, comfy, assets });
 	jobs.attachAssetService(assets);
 	assets.start();
+	const discovery = new ComfyDiscovery(comfy);
+	const mcp = createHubMcpHandler({ config, store, comfy, assets, jobs, discovery });
 	return {
-		close: () => assets.close(),
+		close: async () => {
+			await Promise.all([assets.close(), mcp.close()]);
+		},
 		async fetch(request: Request, server?: HubRequestServer): Promise<Response> {
 			try {
 				const url = new URL(request.url);
 				const path = url.pathname;
 				const mutation = request.method !== "GET" && request.method !== "HEAD";
 				guardRequest(request, config.hubAllowLan, mutation);
+
+				if (path === "/mcp") {
+					guardMcpRequest(request, config.hubAllowLan);
+					if (server && await isMcpJobWaitRequest(request)) server.timeout(request, 0);
+					return await mcp.fetch(request);
+				}
 
 				if (request.method === "GET" && path === "/health") return jsonResponse({ ok: true });
 				if (request.method === "GET" && path === "/api/v1/status") {
@@ -380,7 +457,38 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 					return jsonResponse({ metadata, workflow }, 200, { etag: `"${metadata.sha256}"` });
 				}
 
+				if (request.method === "GET" && path === "/api/v1/comfy/nodes/search") {
+					const limit = parsePositiveQuery(url.searchParams.get("limit"), 50, 100, "limit");
+					const offset = parseOffsetQuery(url.searchParams.get("offset"));
+					return jsonResponse(await discovery.listNodes({ limit, offset, query: url.searchParams.get("q") ?? "" }));
+				}
+				const nodeDetailMatch = /^\/api\/v1\/comfy\/nodes\/([^/]+)$/.exec(path);
+				if (request.method === "GET" && nodeDetailMatch) {
+					return jsonResponse(await discovery.getNode(decodePathSegment(nodeDetailMatch[1]!)));
+				}
 				if (request.method === "GET" && path === "/api/v1/comfy/nodes") return jsonResponse(await comfy.getNodes());
+				if (request.method === "GET" && path === "/api/v1/comfy/models/search") {
+					const limit = parsePositiveQuery(url.searchParams.get("limit"), 50, 100, "limit");
+					const offset = parseOffsetQuery(url.searchParams.get("offset"));
+					const folder = url.searchParams.get("folder") ?? undefined;
+					return jsonResponse(await discovery.listModels({
+						limit,
+						offset,
+						query: url.searchParams.get("q") ?? "",
+						...(folder ? { folder } : {}),
+					}));
+				}
+				const modelDetailMatch = /^\/api\/v1\/comfy\/models\/([^/]+)\/([^/]+)$/.exec(path);
+				if (request.method === "GET" && modelDetailMatch) {
+					return jsonResponse(await discovery.getModel(
+						decodePathSegment(modelDetailMatch[1]!),
+						decodePathSegment(modelDetailMatch[2]!),
+					));
+				}
+				const modelGuideMatch = /^\/api\/v1\/comfy\/model-guide\/([^/]+)$/.exec(path);
+				if (request.method === "GET" && modelGuideMatch) {
+					return jsonResponse(await discovery.modelGuide(decodePathSegment(modelGuideMatch[1]!)));
+				}
 				if (request.method === "GET" && path === "/api/v1/comfy/models") return jsonResponse(await comfy.getModels());
 				const modelMatch = /^\/api\/v1\/comfy\/models\/([^/]+)$/.exec(path);
 				if (request.method === "GET" && modelMatch) {
@@ -411,54 +519,6 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 				return errorResponse(500, "internal_error", "Hub request failed");
 			}
 		},
-	};
-}
-
-async function assetResponse(asset: AssetMetadata, request: Request, store: HubStore): Promise<Record<string, unknown>> {
-	const contentPath = store.assetContentPath(asset);
-	let contentAvailable = false;
-	let status = asset.status;
-	if (contentPath) {
-		try {
-			const info = await stat(contentPath);
-			contentAvailable = info.isFile() && info.size === asset.bytes
-				&& (asset.origin === "input" || asset.status === "ready");
-		} catch {
-			contentAvailable = false;
-		}
-	}
-	if (asset.origin === "output" && asset.status === "ready" && !contentAvailable) status = "pending";
-	const workflowValue = asset.origin === "input" && status === "ready" && asset.comfyFilename !== null
-		? asset.comfySubfolder ? `${asset.comfySubfolder}/${asset.comfyFilename}` : asset.comfyFilename
-		: null;
-	const contentUrl = contentAvailable
-		? new URL(`/api/v1/assets/${encodeURIComponent(asset.id)}/content`, request.url).toString()
-		: null;
-	return {
-		asset_id: asset.id,
-		kind: asset.kind,
-		origin: asset.origin,
-		status,
-		sha256: asset.sha256,
-		bytes: asset.bytes,
-		content_type: asset.contentType,
-		original_filename: asset.originalFilename,
-		original_asset_id: asset.originalAssetId,
-		filename: asset.comfyFilename ?? asset.originalFilename,
-		subfolder: asset.comfySubfolder,
-		type: asset.comfyType,
-		comfy: asset.comfyFilename === null ? null : {
-			filename: asset.comfyFilename,
-			subfolder: asset.comfySubfolder,
-			type: asset.comfyType,
-		},
-		workflow_value: workflowValue,
-		job_id: asset.jobId,
-		node_id: asset.nodeId,
-		output_key: asset.outputKey,
-		download_url: contentUrl,
-		created_at: new Date(asset.createdAt).toISOString(),
-		updated_at: new Date(asset.updatedAt).toISOString(),
 	};
 }
 
