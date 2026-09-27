@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { open, unlink } from "node:fs/promises";
 import { basename } from "node:path";
 import { HttpError } from "./errors.ts";
+import { releaseReaderLock } from "./stream-utils.ts";
 
 const MAX_HEADER_BYTES = 8 * 1024;
 const STREAM_PIECE_BYTES = 64 * 1024;
@@ -189,6 +190,6 @@ export async function streamMultipartFile(
 		await unlink(destination).catch(() => undefined);
 		throw error;
 	} finally {
-		reader.releaseLock();
+		releaseReaderLock(reader);
 	}
 }

@@ -18,6 +18,9 @@ let config: ReturnType<typeof loadConfig>;
 let store: HubStore;
 let comfy: ComfyApiClient;
 let app: ReturnType<typeof createHubApp>;
+let networkServer: ReturnType<typeof Bun.serve> | undefined;
+let networkTimeouts: number[] = [];
+let locklessReaders = 0;
 
 function mockedComfyClient(fetchImpl?: FetchLike): ComfyApiClient {
 	return new ComfyApiClient({
@@ -80,6 +83,52 @@ async function errorCode(response: Response): Promise<string> {
 	return ((await response.json()) as { error: { code: string } }).error.code;
 }
 
+function removeReaderReleaseLock(stream: ReadableStream<Uint8Array> | null): void {
+	if (!stream) return;
+	const getReader = stream.getReader.bind(stream);
+	Object.defineProperty(stream, "getReader", {
+		configurable: true,
+		value: () => {
+			const reader = getReader();
+			Object.defineProperty(reader, "releaseLock", { configurable: true, value: undefined });
+			locklessReaders++;
+			return reader;
+		},
+	});
+}
+
+function startNetworkServer(): URL {
+	networkTimeouts = [];
+	locklessReaders = 0;
+	networkServer = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, server) {
+			const path = new URL(request.url).pathname;
+			if (path === "/mcp") {
+				const clone = request.clone.bind(request);
+				Object.defineProperty(request, "clone", {
+					configurable: true,
+					value: () => {
+						const copy = clone();
+						removeReaderReleaseLock(copy.body);
+						return copy;
+					},
+				});
+			} else {
+				removeReaderReleaseLock(request.body);
+			}
+			return app.fetch(request, {
+				timeout: (timedRequest, seconds) => {
+					networkTimeouts.push(seconds);
+					server.timeout(timedRequest, seconds);
+				},
+			});
+		},
+	});
+	return networkServer.url;
+}
+
 beforeEach(async () => {
 	root = await mkdtemp(join(tmpdir(), "comfy-hub-test-"));
 	config = loadConfig({
@@ -96,6 +145,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	networkServer?.stop(true);
+	networkServer = undefined;
+	await app.close();
 	store.close();
 	await rm(root, { recursive: true, force: true });
 });
@@ -331,6 +383,94 @@ describe("workflow staging and immutable storage", () => {
 });
 
 describe("HTTP boundaries and Comfy proxy", () => {
+	test("stages and commits a real TCP FormData upload with JSON REST using lockless request readers", async () => {
+		const baseUrl = startNetworkServer();
+		const form = new FormData();
+		form.append("file", new Blob([validWorkflow], { type: "application/json" }), "network-workflow.json");
+		const uploadResponse = await fetch(new URL("/api/v1/uploads", baseUrl), { method: "POST", body: form });
+		expect(uploadResponse.status).toBe(201);
+		const staged = await uploadResponse.json() as { upload_id: string; sha256: string; bytes: number; filename: string };
+		expect(staged).toMatchObject({
+			sha256: createHash("sha256").update(validWorkflow).digest("hex"),
+			bytes: validWorkflow.byteLength,
+			filename: "network-workflow.json",
+		});
+
+		const commitResponse = await fetch(new URL("/api/v1/workflows", baseUrl), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ upload_id: staged.upload_id, name: "TCP upload" }),
+		});
+		expect(commitResponse.status).toBe(201);
+		const workflow = await commitResponse.json() as { id: string; name: string; filename: string };
+		expect(workflow).toMatchObject({ id: staged.sha256, name: "TCP upload", filename: "network-workflow.json" });
+		expect(store.workflowCount()).toBe(1);
+
+		const malformedJson = await fetch(new URL("/api/v1/workflows", baseUrl), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{broken",
+		});
+		expect(malformedJson.status).toBe(400);
+		expect(await errorCode(malformedJson)).toBe("invalid_json");
+		expect(locklessReaders).toBe(3);
+	});
+
+	test("preserves invalid multipart response codes with lockless readers over real TCP", async () => {
+		const baseUrl = startNetworkServer();
+		const boundary = "network-invalid-boundary";
+		const invalidBody = `--${boundary}\r\nContent-Disposition: form-data; name="other"\r\n\r\nnope\r\n--${boundary}--\r\n`;
+		const response = await fetch(new URL("/api/v1/uploads", baseUrl), {
+			method: "POST",
+			headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+			body: invalidBody,
+		});
+		expect(response.status).toBe(400);
+		expect(await errorCode(response)).toBe("invalid_multipart");
+		expect(locklessReaders).toBe(1);
+	});
+
+	test("inspects a long-wait MCP body from a real network request before passing it through", async () => {
+		await app.close();
+		const jobId = "11111111-1111-4111-8111-111111111111";
+		comfy = mockedComfyClient(async (input) => {
+			if (new URL(String(input)).pathname === `/api/jobs/${jobId}`) {
+				return Response.json({ id: jobId, status: "completed", outputs: {} });
+			}
+			return Response.json({});
+		});
+		app = createHubApp({ config, store, comfy });
+		const baseUrl = startNetworkServer();
+		const sendRpc = (body: Record<string, unknown>) => fetch(new URL("/mcp", baseUrl), {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				accept: "application/json, text/event-stream",
+			},
+			body: JSON.stringify(body),
+		});
+		const initialized = await sendRpc({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "initialize",
+			params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "tcp-test", version: "1.0.0" } },
+		});
+		expect(initialized.status).toBe(200);
+		const notification = await sendRpc({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+		expect(notification.status).toBe(202);
+
+		const waitResponse = await sendRpc({
+			jsonrpc: "2.0",
+			id: 2,
+			method: "tools/call",
+			params: { name: "job_wait", arguments: { job_id: jobId, timeout_seconds: 300 } },
+		});
+		expect(waitResponse.status).toBe(200);
+		expect(await waitResponse.text()).toContain('"wait_timed_out":false');
+		expect(networkTimeouts).toEqual([0]);
+		expect(locklessReaders).toBe(3);
+	});
+
 	test("accepts multipart delimiters split across one-byte chunks", async () => {
 		const response = await app.fetch(multipartRequest(validWorkflow, { chunkSize: 1 }));
 		expect(response.status).toBe(201);

@@ -10,6 +10,7 @@ import { JobService } from "./jobs.ts";
 import { JobProgressService, type JobProgressServiceOptions } from "./job-progress.ts";
 import { createHubMcpHandler } from "./mcp.ts";
 import { streamMultipartFile } from "./multipart.ts";
+import { releaseReaderLock } from "./stream-utils.ts";
 import { type AssetMetadata, HubStore } from "./storage.ts";
 
 const JSON_BODY_LIMIT = 16 * 1024;
@@ -46,7 +47,7 @@ async function readJsonBody(request: Request): Promise<unknown> {
 		await reader.cancel(error).catch(() => undefined);
 		throw error;
 	} finally {
-		reader.releaseLock();
+		releaseReaderLock(reader);
 	}
 	try {
 		const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), size);
@@ -280,7 +281,7 @@ async function isMcpJobWaitRequest(request: Request): Promise<boolean> {
 	} catch {
 		return false;
 	} finally {
-		reader.releaseLock();
+		releaseReaderLock(reader);
 	}
 	try {
 		const body = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), size).toString("utf8")) as unknown;

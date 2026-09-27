@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { open, link, rename, stat, unlink } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { ComfyUpstreamError, HttpError } from "./errors.ts";
+import { releaseReaderLock } from "./stream-utils.ts";
 import type { ComfyApiClient, ComfyFileReference } from "./comfy-client.ts";
 import type { AssetMetadata, HubStore, InputAssetKind, OutputAssetKind, StagedAssetUpload } from "./storage.ts";
 
@@ -306,7 +307,7 @@ export class AssetService {
 			await unlink(tempPath).catch(() => undefined);
 			throw error;
 		} finally {
-			reader.releaseLock();
+			releaseReaderLock(reader);
 		}
 	}
 }

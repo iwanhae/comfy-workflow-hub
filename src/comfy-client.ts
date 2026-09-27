@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ComfyPromptRejectedError, ComfyUpstreamError } from "./errors.ts";
+import { releaseReaderLock } from "./stream-utils.ts";
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -310,7 +311,7 @@ function createMultipartStream(input: {
 					controller.enqueue(next.value);
 					return;
 				}
-				reader.releaseLock();
+				releaseReaderLock(reader);
 				readerReleased = true;
 				state = "fields";
 			}
@@ -331,7 +332,7 @@ function createMultipartStream(input: {
 		async cancel(reason) {
 			if (!readerReleased) {
 				await reader.cancel(reason).catch(() => undefined);
-				reader.releaseLock();
+				releaseReaderLock(reader);
 				readerReleased = true;
 			}
 		},
@@ -371,11 +372,7 @@ async function readResponsePreview(response: Response, maxBytes: number, timeout
 		void reader.cancel(error).catch(() => undefined);
 	} finally {
 		clearTimeout(timer!);
-		try {
-			reader.releaseLock();
-		} catch {
-			// A timed-out read may still be unwinding after cancellation.
-		}
+		releaseReaderLock(reader);
 	}
 	return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total));
 }
