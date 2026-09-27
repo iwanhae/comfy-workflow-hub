@@ -106,6 +106,9 @@ curl 'http://127.0.0.1:3000/api/v1/jobs?limit=50&offset=0'
 curl http://127.0.0.1:3000/api/v1/jobs/<job-uuid>
 curl 'http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/wait?timeout=300'
 curl -X POST http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/cancel
+
+# Stream an initial safe job snapshot and live job/state deltas (same origin).
+curl -N http://127.0.0.1:3000/api/v1/events
 ```
 
 | Method and route | Result |
@@ -126,6 +129,7 @@ curl -X POST http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/cancel
 | `GET /api/v1/jobs/:uuid` | Current ComfyUI job, including execution errors and outputs |
 | `GET /api/v1/jobs/:uuid/wait?timeout=300` | Poll up to 300 seconds (the default); returns the latest job plus `wait_timed_out` |
 | `POST /api/v1/jobs/:uuid/cancel` | Remove only a pending job; running jobs are never interrupted; uncertain results return `202` |
+| `GET /api/v1/events` | Same-origin Server-Sent Events: initial job snapshot, job/state deltas, and heartbeat |
 | `GET /api/v1/comfy/nodes` | ComfyUI `GET /object_info` |
 | `GET /api/v1/comfy/models` | ComfyUI `GET /models` |
 | `GET /api/v1/comfy/models/:folder` | ComfyUI `GET /models/:folder` |
@@ -227,6 +231,57 @@ failure) `execution_error`. The hub follows `has_more` across all pages, then
 adds its local `workflow_id` mapping; externally submitted ComfyUI jobs remain
 visible. If `/api/jobs/:id` misses a job, the hub checks the corresponding
 `/history/:id` and `/queue` records before returning not found.
+
+### Live job events
+
+The first `GET /api/v1/events` starts one Hub-owned ComfyUI WebSocket connection
+to `/ws?clientId=<durable-hub-client-id>`. The Hub converts only the configured
+`COMFY_BASE_URL` scheme (`http` → `ws`, `https` → `wss`); it does not accept a
+client-supplied upstream URL. All connected browser/agent clients share the same
+Hub progress state. The upstream `status`, `executing`, `progress`,
+`progress_state`, `executed`, and terminal execution messages are reduced to
+small job/state records. Binary preview frames, full prompts, node outputs,
+tracebacks, and arbitrary upstream fields are not forwarded.
+
+An SSE connection first receives a `snapshot` event:
+
+```json
+{
+  "type": "snapshot",
+  "sequence": 12,
+  "state": { "upstream": "connected", "queue_remaining": 2, "last_reconciled_at": "..." },
+  "jobs": [
+    {
+      "job_id": "<comfy-prompt-id>",
+      "status": "in_progress",
+      "workflow_id": "<sha256-or-omitted-for-external-jobs>",
+      "current_node": { "node_id": "17" },
+      "progress": { "value": 4, "max": 20 },
+      "updated_at": "..."
+    }
+  ],
+  "truncated": false
+}
+```
+
+After the snapshot, `job` events contain `{type, sequence, job}` when a job
+changes; `state` events contain `{type, sequence, state}` for upstream
+connection/queue changes; `heartbeat` events keep idle streams alive. A job
+record is keyed by `job_id`, and includes status, the Hub workflow mapping when
+known, current/completed node IDs, bounded node progress, and timestamps. Status
+is monotonic (`pending` → `in_progress` → terminal), so delayed queue snapshots
+or WebSocket messages cannot revive a completed/failed/cancelled job. The feed
+does not replay deltas: EventSource reconnects receive a new snapshot.
+
+The Hub also reconciles paginated `GET /api/jobs` and `GET /queue` every five
+seconds, and immediately after each WebSocket connect/reconnect. This surfaces
+jobs submitted by other clients and repairs missed completions/server restarts
+without making a `/history/:id` request for every job. The feed retains at most
+1,000 job projections and accepts at most 50 SSE subscribers. A slow subscriber
+is closed and can reconnect for a fresh snapshot. Host and any supplied Origin
+are checked for this GET route; no CORS access is enabled. Progress and
+subscriber state are process-local, consistent with the Hub's single-process
+per-`DATA_DIR` requirement.
 
 An attempt that was persisted but cannot yet be found upstream is returned with
 hub-only `status: "submission_unknown"` and `local_submission_state`; a stored

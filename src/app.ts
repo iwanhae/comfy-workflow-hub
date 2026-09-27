@@ -7,6 +7,7 @@ import { ComfyApiClient } from "./comfy-client.ts";
 import { ComfyDiscovery } from "./discovery.ts";
 import { ComfyUpstreamError, HttpError } from "./errors.ts";
 import { JobService } from "./jobs.ts";
+import { JobProgressService, type JobProgressServiceOptions } from "./job-progress.ts";
 import { createHubMcpHandler } from "./mcp.ts";
 import { streamMultipartFile } from "./multipart.ts";
 import { type AssetMetadata, HubStore } from "./storage.ts";
@@ -204,14 +205,25 @@ function decodeJobId(value: string): string {
 	return id;
 }
 
-function guardRequest(request: Request, allowLan: boolean, isMutation: boolean): void {
+function guardRequest(request: Request, allowLan: boolean, isMutation: boolean, requireSameOrigin = false): void {
 	const url = new URL(request.url);
 	if (!isAllowedRequestHost(url.hostname, allowLan)) {
 		throw new HttpError(403, "host_not_allowed", "Request Host must be loopback or an explicitly enabled private-LAN address");
 	}
-	if (isMutation) {
+	const host = request.headers.get("host");
+	if (host !== null) {
+		try {
+			const hostUrl = new URL(`${url.protocol}//${host}`);
+			if (hostUrl.username || hostUrl.password || hostUrl.pathname !== "/" || hostUrl.search || hostUrl.hash || hostUrl.origin !== url.origin) {
+				throw new Error("host mismatch");
+			}
+		} catch {
+			throw new HttpError(403, "host_not_allowed", "Request Host must match the Hub request origin");
+		}
+	}
+	if (isMutation || requireSameOrigin) {
 		const origin = request.headers.get("origin");
-		if (origin) {
+		if (origin !== null) {
 			try {
 				if (new URL(origin).origin !== url.origin) throw new Error("cross-origin");
 			} catch {
@@ -291,13 +303,14 @@ export interface HubAppOptions {
 	store: HubStore;
 	comfy: ComfyApiClient;
 	jobs?: JobService;
+	jobProgressOptions?: Partial<Omit<JobProgressServiceOptions, "comfy" | "jobs" | "clientId">>;
 }
 
 export interface HubRequestServer {
 	timeout(request: Request, seconds: number): void;
 }
 
-export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAppOptions): {
+export function createHubApp({ config, store, comfy, jobs: suppliedJobs, jobProgressOptions }: HubAppOptions): {
 	fetch: (request: Request, server?: HubRequestServer) => Promise<Response>;
 	close: () => Promise<void>;
 } {
@@ -311,11 +324,13 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 	});
 	const jobs = suppliedJobs ?? new JobService({ store, comfy, assets });
 	jobs.attachAssetService(assets);
+	const jobProgress = new JobProgressService({ comfy, jobs, clientId: store.clientId, ...jobProgressOptions });
 	assets.start();
 	const discovery = new ComfyDiscovery(comfy);
 	const mcp = createHubMcpHandler({ config, store, comfy, assets, jobs, discovery });
 	return {
 		close: async () => {
+			jobProgress.close();
 			await Promise.all([assets.close(), mcp.close()]);
 		},
 		async fetch(request: Request, server?: HubRequestServer): Promise<Response> {
@@ -323,7 +338,7 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 				const url = new URL(request.url);
 				const path = url.pathname;
 				const mutation = request.method !== "GET" && request.method !== "HEAD";
-				guardRequest(request, config.hubAllowLan, mutation);
+				guardRequest(request, config.hubAllowLan, mutation, request.method === "GET" && path === "/api/v1/events");
 
 				if (path === "/mcp") {
 					guardMcpRequest(request, config.hubAllowLan);
@@ -338,6 +353,16 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 						workflow_count: store.workflowCount(),
 						comfy_configured: true,
 					});
+				}
+
+				if (request.method === "GET" && path === "/api/v1/events") {
+					server?.timeout(request, 0);
+					jobProgress.assertSubscriberCapacity();
+					jobProgress.start();
+					await jobProgress.refreshNow();
+					if (request.signal.aborted) return new Response(null, { status: 499 });
+					jobProgress.assertSubscriberCapacity();
+					return jobProgress.createSseResponse(request.signal);
 				}
 
 				if (request.method === "POST" && path === "/api/v1/uploads") {
@@ -398,6 +423,8 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 				if (request.method === "POST" && path === "/api/v1/jobs") {
 					const input = parseJobSubmission(await readJsonBody(request));
 					const result = await jobs.submit(input, request.signal);
+					const progressStatus = result.status === "submitted" ? "pending" : result.status === "cancelled" ? "cancelled" : "submission_unknown";
+					jobProgress.noteSubmission(result.job_id, result.workflow_id, progressStatus);
 					return jsonResponse(result, result.reused ? 200 : result.status === "submission_unknown" ? 202 : 201);
 				}
 
@@ -422,6 +449,7 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 					}
 					if (action === "cancel" && request.method === "POST") {
 						const result = await jobs.cancel(jobId, request.signal);
+						if (result.cancelled === true) jobProgress.noteCancellation(jobId);
 						return jsonResponse(result, result.outcome === "unknown" ? 202 : 200);
 					}
 				}

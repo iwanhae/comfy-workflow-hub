@@ -63,6 +63,10 @@ export class ComfyApiClient {
 		this.timeoutMs = options.timeoutMs;
 	}
 
+	getBaseUrl(): URL {
+		return new URL(this.baseUrl);
+	}
+
 	getNodes(signal?: AbortSignal): Promise<unknown> {
 		return this.get("/object_info", signal);
 	}

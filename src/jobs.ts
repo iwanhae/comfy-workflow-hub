@@ -119,28 +119,7 @@ export class JobService {
 	}
 
 	async list(options: { limit: number; offset: number; signal?: AbortSignal }): Promise<JobListResult> {
-		const upstream = await this.listAllUpstreamJobs(options.signal);
-		const localSubmissions = this.store.listJobSubmissions();
-		const localById = new Map(localSubmissions.map((submission) => [submission.promptId, submission]));
-		const seen = new Set<string>();
-		const jobs: ComfyJob[] = [];
-
-		for (const job of upstream) {
-			if (typeof job.id !== "string" || seen.has(job.id)) continue;
-			seen.add(job.id);
-			const local = localById.get(job.id);
-			jobs.push(local ? addLocalMapping(job, this.reconcileSubmission(local)) : job);
-		}
-
-		for (const submission of localSubmissions) {
-			if (seen.has(submission.promptId)) continue;
-			const local = localAttemptJob(submission);
-			if (!local) continue;
-			seen.add(submission.promptId);
-			jobs.push(local);
-		}
-
-		jobs.sort((a, b) => numericField(b, "create_time") - numericField(a, "create_time"));
+		const jobs = await this.listForProgress(options.signal);
 		const total = jobs.length;
 		const page = jobs.slice(options.offset, options.offset + options.limit);
 		for (let index = 0; index < page.length; index += 3) {
@@ -155,6 +134,44 @@ export class JobService {
 				has_more: options.offset + page.length < total,
 			},
 		};
+	}
+
+	/**
+	 * Return the cheap job records used by the shared live-progress feed. Unlike
+	 * the REST board list, this deliberately does not archive completed outputs
+	 * (which would turn each completed record into a /history/:id request).
+	 */
+	async listForProgress(signal?: AbortSignal, options: { includeAcceptedFallback?: boolean } = {}): Promise<ComfyJob[]> {
+		const upstream = await this.listAllUpstreamJobs(signal);
+		const localSubmissions = this.store.listJobSubmissions();
+		const localById = new Map(localSubmissions.map((submission) => [submission.promptId, submission]));
+		const seen = new Set<string>();
+		const jobs: ComfyJob[] = [];
+
+		for (const job of upstream) {
+			if (typeof job.id !== "string" || seen.has(job.id)) continue;
+			seen.add(job.id);
+			const local = localById.get(job.id);
+			jobs.push(local ? addLocalMapping(job, this.reconcileSubmission(local)) : job);
+		}
+
+		for (const submission of localSubmissions) {
+			if (seen.has(submission.promptId)) continue;
+			const local = localAttemptJob(submission) ?? (options.includeAcceptedFallback && submission.state === "accepted"
+				? {
+					id: submission.promptId,
+					status: "pending",
+					workflow_id: submission.workflowId,
+					create_time: submission.createdAt,
+				}
+				: null);
+			if (!local) continue;
+			seen.add(submission.promptId);
+			jobs.push(local);
+		}
+
+		jobs.sort((a, b) => numericField(b, "create_time") - numericField(a, "create_time"));
+		return jobs;
 	}
 
 	async get(promptId: string, signal?: AbortSignal): Promise<ComfyJob> {
