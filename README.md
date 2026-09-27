@@ -11,8 +11,42 @@ durably submitting/tracking ComfyUI jobs. SQLite records live under `DATA_DIR`
 bun install
 bun run typecheck
 bun test
+bun run build
 bun run hub
 ```
+
+For frontend development, run the Hub and Vite in separate terminals:
+
+```sh
+# Terminal 1: Hub API at 127.0.0.1:3000
+bun run hub
+
+# Terminal 2: React/Vite UI at 127.0.0.1:5173, proxying /api, /mcp, and /health
+bun run dev
+```
+
+`bun run build` writes the production UI to the ignored `web/dist/` directory;
+`bun run hub` then serves it at `/` and provides SPA fallback only for known UI
+routes. The static handler never handles `/api`, `/mcp`, or `/health`, rejects
+traversal and outside-directory symlinks, and does not turn missing asset URLs
+into HTML. `bun run test:ui` runs the jsdom browser-flow tests; `bun run
+typecheck` checks both the Hub and browser TypeScript projects.
+
+The WebUI is a shared, unauthenticated workspace surface (use only on a trusted
+network; see the security note below). It has no canvas editor or sign-in flow.
+The board shows Hub and external ComfyUI jobs, live SSE progress with fresh
+snapshots after reconnect, and periodic REST refresh as a fallback. Job details
+include the saved workflow association, errors, output archive status, and
+same-origin image/audio/video previews with original downloads. Cancellation is
+offered only for `pending` jobs; running jobs are never interrupted.
+
+Workflow files are selected in the browser, staged as multipart bytes, then
+committed to the immutable workflow library. The UI submits only a stored
+`workflow_id` and includes a retry-safe `client_request_id`. For input assets,
+select an image or mask file locally; masks are tied to a ready original image.
+The returned `workflow_value` is displayed for copying into a locally edited
+API-format workflow—the Hub never modifies stored workflow JSON. Node/model
+search and full detail plus the Qwen Image 2.1 guide are read-only.
 
 The hub listens on `127.0.0.1:3000` by default. Persistent state is kept in
 `./data/` and is ignored by git. SQLite uses WAL mode; workflow bytes live in

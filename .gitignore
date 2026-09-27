@@ -5,6 +5,7 @@ node_modules
 outputs/
 out
 dist
+web/dist/
 *.tgz
 
 # persistent hub state (SQLite, staged uploads, immutable workflows)

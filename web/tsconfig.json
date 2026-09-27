@@ -1,0 +1,9 @@
+{
+	"extends": "../tsconfig.json",
+	"compilerOptions": {
+		"lib": ["ESNext", "DOM", "DOM.Iterable", "DOM.AsyncIterable"],
+		"types": ["bun", "vite/client"]
+	},
+	"include": ["src/**/*.ts", "src/**/*.tsx"],
+	"exclude": []
+}
