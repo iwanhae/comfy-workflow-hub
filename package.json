@@ -5,6 +5,8 @@
   "private": true,
   "scripts": {
     "start": "bun run index.ts",
+    "hub": "bun run src/main.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

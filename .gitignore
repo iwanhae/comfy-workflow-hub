@@ -7,6 +7,9 @@ out
 dist
 *.tgz
 
+# persistent hub state (SQLite, staged uploads, immutable workflows)
+data/
+
 # code coverage
 coverage
 *.lcov
