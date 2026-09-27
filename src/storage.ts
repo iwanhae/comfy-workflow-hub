@@ -51,6 +51,91 @@ export interface WorkflowUploadMetadata {
 	description?: string | null;
 }
 
+export type InputAssetKind = "image" | "mask";
+export type OutputAssetKind = "image" | "video" | "audio" | "file";
+export type AssetKind = InputAssetKind | OutputAssetKind;
+export type AssetOrigin = "input" | "output";
+export type AssetStatus = "uploading" | "ambiguous" | "ready" | "rejected" | "pending";
+
+export interface AssetMetadata {
+	id: string;
+	kind: AssetKind;
+	origin: AssetOrigin;
+	status: AssetStatus;
+	sha256: string | null;
+	bytes: number | null;
+	contentType: string | null;
+	originalFilename: string | null;
+	storageName: string | null;
+	uploadId: string | null;
+	originalAssetId: string | null;
+	comfyFilename: string | null;
+	comfySubfolder: string | null;
+	comfyType: string | null;
+	jobId: string | null;
+	nodeId: string | null;
+	outputKey: string | null;
+	sourceFilename: string | null;
+	sourceSubfolder: string | null;
+	sourceType: string | null;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export interface StagedAssetUpload extends StagedUpload {}
+
+interface AssetRow {
+	id: string;
+	kind: AssetKind;
+	origin: AssetOrigin;
+	status: AssetStatus;
+	sha256: string | null;
+	bytes: number | null;
+	content_type: string | null;
+	original_filename: string | null;
+	storage_name: string | null;
+	upload_id: string | null;
+	original_asset_id: string | null;
+	comfy_filename: string | null;
+	comfy_subfolder: string | null;
+	comfy_type: string | null;
+	job_id: string | null;
+	node_id: string | null;
+	output_key: string | null;
+	source_filename: string | null;
+	source_subfolder: string | null;
+	source_type: string | null;
+	created_at: number;
+	updated_at: number;
+}
+
+function assetFromRow(row: AssetRow): AssetMetadata {
+	return {
+		id: row.id,
+		kind: row.kind,
+		origin: row.origin,
+		status: row.status,
+		sha256: row.sha256,
+		bytes: row.bytes,
+		contentType: row.content_type,
+		originalFilename: row.original_filename,
+		storageName: row.storage_name,
+		uploadId: row.upload_id,
+		originalAssetId: row.original_asset_id,
+		comfyFilename: row.comfy_filename,
+		comfySubfolder: row.comfy_subfolder,
+		comfyType: row.comfy_type,
+		jobId: row.job_id,
+		nodeId: row.node_id,
+		outputKey: row.output_key,
+		sourceFilename: row.source_filename,
+		sourceSubfolder: row.source_subfolder,
+		sourceType: row.source_type,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+
 export type JobSubmissionState = "submitting" | "accepted" | "ambiguous" | "rejected" | "cancelled";
 
 export interface JobSubmission {
@@ -126,6 +211,9 @@ export class HubStore {
 	readonly dataDir: string;
 	readonly stagingDir: string;
 	readonly workflowsDir: string;
+	readonly assetsDir: string;
+	readonly inputAssetsDir: string;
+	readonly outputAssetsDir: string;
 	readonly clientId: string;
 	private readonly now: () => number;
 	private readonly uploadTtlMs: number;
@@ -137,6 +225,9 @@ export class HubStore {
 		this.dataDir = options.dataDir;
 		this.stagingDir = join(options.dataDir, "staging");
 		this.workflowsDir = join(options.dataDir, "workflows");
+		this.assetsDir = join(options.dataDir, "assets");
+		this.inputAssetsDir = join(this.assetsDir, "inputs");
+		this.outputAssetsDir = join(options.dataDir, "outputs");
 		this.uploadTtlMs = options.uploadTtlMs;
 		this.now = options.now ?? Date.now;
 		this.recoveryGraceMs = options.recoveryGraceMs ?? 24 * 60 * 60 * 1000;
@@ -144,7 +235,7 @@ export class HubStore {
 		this.db = new Database(join(options.dataDir, "hub.sqlite"), { create: true });
 		this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
 		const versionRow = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
-		if (versionRow.user_version > 3) throw new Error(`Hub database schema ${versionRow.user_version} is newer than this server`);
+		if (versionRow.user_version > 4) throw new Error(`Hub database schema ${versionRow.user_version} is newer than this server`);
 		const migrate = this.db.transaction(() => {
 			this.db.exec(`
 				CREATE TABLE IF NOT EXISTS staged_uploads (
@@ -195,7 +286,40 @@ export class HubStore {
 					);
 				`);
 			}
-			this.db.exec("PRAGMA user_version = 3");
+			if (versionRow.user_version < 4) {
+				this.db.exec(`
+					CREATE TABLE assets (
+						id TEXT PRIMARY KEY,
+						kind TEXT NOT NULL CHECK (kind IN ('image', 'mask', 'video', 'audio', 'file')),
+						origin TEXT NOT NULL CHECK (origin IN ('input', 'output')),
+						status TEXT NOT NULL CHECK (status IN ('uploading', 'ambiguous', 'ready', 'rejected', 'pending')),
+						sha256 TEXT,
+						bytes INTEGER CHECK (bytes IS NULL OR bytes >= 0),
+						content_type TEXT,
+						original_filename TEXT,
+						storage_name TEXT,
+						upload_id TEXT UNIQUE,
+						original_asset_id TEXT REFERENCES assets(id),
+						comfy_filename TEXT,
+						comfy_subfolder TEXT,
+						comfy_type TEXT,
+						job_id TEXT,
+						node_id TEXT,
+						output_key TEXT,
+						source_filename TEXT,
+						source_subfolder TEXT,
+						source_type TEXT,
+						created_at INTEGER NOT NULL,
+						updated_at INTEGER NOT NULL,
+						CHECK ((origin = 'input' AND upload_id IS NOT NULL) OR (origin = 'output' AND job_id IS NOT NULL AND node_id IS NOT NULL))
+					);
+					CREATE INDEX assets_created ON assets(created_at DESC, id DESC);
+					CREATE INDEX assets_job_node ON assets(job_id, node_id, created_at DESC);
+					CREATE UNIQUE INDEX assets_output_identity ON assets(job_id, node_id, source_filename, source_subfolder, source_type)
+						WHERE origin = 'output';
+				`);
+			}
+			this.db.exec("PRAGMA user_version = 4");
 		});
 		migrate.immediate();
 		const clientId = this.db.transaction(() => {
@@ -211,8 +335,22 @@ export class HubStore {
 		await Promise.all([
 			mkdir(this.stagingDir, { recursive: true, mode: 0o700 }),
 			mkdir(this.workflowsDir, { recursive: true, mode: 0o700 }),
+			mkdir(this.inputAssetsDir, { recursive: true, mode: 0o700 }),
+			mkdir(this.outputAssetsDir, { recursive: true, mode: 0o700 }),
 		]);
+		// A process can die after ComfyUI accepted an upload but before its response
+		// was committed locally. Such an attempt must never be POSTed a second time.
+		this.db.prepare("UPDATE assets SET status = 'ambiguous', updated_at = ? WHERE origin = 'input' AND status = 'uploading'").run(this.now());
 		await this.reapExpiredUploads();
+		await this.reapPartialOutputArchives();
+	}
+
+	private async reapPartialOutputArchives(): Promise<void> {
+		const entries = await readdir(this.outputAssetsDir, { withFileTypes: true });
+		await Promise.all(entries.map(async (entry) => {
+			if (!entry.isFile() || !/^\.out_[a-f0-9]{64}\.[0-9a-f-]{36}\.partial$/.test(entry.name)) return;
+			await unlink(join(this.outputAssetsDir, entry.name)).catch(() => undefined);
+		}));
 	}
 
 	beginStaging(uploadId: string): void {
@@ -429,6 +567,232 @@ export class HubStore {
 		return { metadata, workflow, workflowJson };
 	}
 
+	getInputAssetByUploadId(uploadId: string): AssetMetadata | null {
+		const row = this.db.prepare("SELECT * FROM assets WHERE upload_id = ?").get(uploadId) as AssetRow | null;
+		return row ? assetFromRow(row) : null;
+	}
+
+	getAsset(id: string): AssetMetadata | null {
+		if (!isAssetId(id)) return null;
+		const row = this.db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow | null;
+		return row ? assetFromRow(row) : null;
+	}
+
+	getMaskOriginalAsset(id: string): AssetMetadata | null {
+		const asset = this.getAsset(id);
+		return asset?.kind === "image" && asset.status === "ready" && asset.comfyFilename !== null
+			&& asset.comfySubfolder !== null && asset.comfyType !== null
+			? asset
+			: null;
+	}
+
+	claimStagedAssetUpload(uploadId: string): StagedAssetUpload {
+		if (!/^[0-9a-f-]{36}$/.test(uploadId)) throw new HttpError(400, "invalid_upload_id", "upload_id must be a UUID");
+		const now = this.now();
+		const claim = this.db.prepare(`
+			UPDATE staged_uploads SET state = 'claimed', claimed_at = ?
+			WHERE upload_id = ? AND state = 'ready' AND expires_at > ?
+			RETURNING upload_id, sha256, bytes, filename, content_type, created_at, expires_at
+		`).get(now, uploadId, now) as Omit<StagedRow, "state"> | null;
+		if (!claim) {
+			const previous = this.db.prepare("SELECT state, expires_at FROM staged_uploads WHERE upload_id = ?").get(uploadId) as
+				| { state: string; expires_at: number }
+				| null;
+			if (previous?.state === "expired" || (previous?.state === "ready" && previous.expires_at <= now)) {
+				this.db.prepare("UPDATE staged_uploads SET state = 'expired' WHERE upload_id = ? AND state = 'ready'").run(uploadId);
+				throw new HttpError(410, "upload_expired", "The staged upload has expired");
+			}
+			if (previous) throw new HttpError(409, "upload_already_claimed", "The upload_id has already been used");
+			throw new HttpError(404, "upload_not_found", "No staged upload exists for this upload_id");
+		}
+		this.activeClaims.add(uploadId);
+		return {
+			uploadId: claim.upload_id,
+			sha256: claim.sha256,
+			bytes: claim.bytes,
+			filename: claim.filename,
+			contentType: claim.content_type,
+			createdAt: claim.created_at,
+			expiresAt: claim.expires_at,
+		};
+	}
+
+	finishAssetClaim(uploadId: string): void {
+		this.activeClaims.delete(uploadId);
+	}
+
+	async rejectClaimedAssetUpload(uploadId: string): Promise<void> {
+		this.db.prepare("UPDATE staged_uploads SET state = 'rejected', claimed_at = NULL WHERE upload_id = ? AND state = 'claimed'").run(uploadId);
+		this.activeClaims.delete(uploadId);
+		await unlink(this.stagingPath(uploadId)).catch(() => undefined);
+	}
+
+	createInputAsset(input: {
+		id: string;
+		kind: InputAssetKind;
+		upload: StagedAssetUpload;
+		sha256: string;
+		bytes: number;
+		contentType: string;
+		storageName: string;
+		originalAssetId: string | null;
+	}): AssetMetadata {
+		assertAssetId(input.id);
+		assertStorageName(input.storageName);
+		const now = this.now();
+		const commit = this.db.transaction(() => {
+			const consumed = this.db.prepare(`
+				UPDATE staged_uploads SET state = 'consumed', claimed_at = NULL
+				WHERE upload_id = ? AND state = 'claimed'
+			`).run(input.upload.uploadId);
+			if (consumed.changes === 0) throw new HttpError(409, "upload_already_claimed", "The upload_id has already been used");
+			this.db.prepare(`
+				INSERT INTO assets(
+					id, kind, origin, status, sha256, bytes, content_type, original_filename,
+					storage_name, upload_id, original_asset_id, created_at, updated_at
+				) VALUES (?, ?, 'input', 'uploading', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				input.id,
+				input.kind,
+				input.sha256,
+				input.bytes,
+				input.contentType,
+				input.upload.filename,
+				input.storageName,
+				input.upload.uploadId,
+				input.originalAssetId,
+				now,
+				now,
+			);
+			const row = this.db.prepare("SELECT * FROM assets WHERE id = ?").get(input.id) as AssetRow | null;
+			if (!row) throw new Error("Input asset intent was not persisted");
+			return assetFromRow(row);
+		});
+		const asset = commit.immediate();
+		this.activeClaims.delete(input.upload.uploadId);
+		return asset;
+	}
+
+	finishInputAssetUpload(id: string, ref: { filename: string; subfolder: string; type: string }): AssetMetadata {
+		return this.updateAsset(id, `
+			UPDATE assets SET status = 'ready', comfy_filename = ?, comfy_subfolder = ?, comfy_type = ?, updated_at = ?
+			WHERE id = ? AND origin = 'input' AND status = 'uploading'
+		`, [ref.filename, ref.subfolder, ref.type, this.now(), id]);
+	}
+
+	markInputAssetAmbiguous(id: string): AssetMetadata {
+		return this.updateAsset(id, `
+			UPDATE assets SET status = 'ambiguous', updated_at = ?
+			WHERE id = ? AND origin = 'input' AND status IN ('uploading', 'ambiguous')
+		`, [this.now(), id]);
+	}
+
+	markInputAssetRejected(id: string): AssetMetadata {
+		return this.updateAsset(id, `
+			UPDATE assets SET status = 'rejected', updated_at = ?
+			WHERE id = ? AND origin = 'input' AND status IN ('uploading', 'ambiguous', 'rejected')
+		`, [this.now(), id]);
+	}
+
+	ensureOutputAsset(input: {
+		id: string;
+		kind: OutputAssetKind;
+		jobId: string;
+		nodeId: string;
+		outputKey: string;
+		filename: string;
+		subfolder: string;
+		type: string;
+		storageName: string;
+		contentType: string;
+	}): AssetMetadata {
+		assertAssetId(input.id);
+		assertStorageName(input.storageName);
+		const now = this.now();
+		this.db.prepare(`
+			INSERT OR IGNORE INTO assets(
+				id, kind, origin, status, content_type, original_filename, storage_name,
+				job_id, node_id, output_key, source_filename, source_subfolder, source_type,
+				created_at, updated_at
+			) VALUES (?, ?, 'output', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`).run(
+			input.id,
+			input.kind,
+			input.contentType,
+			input.filename,
+			input.storageName,
+			input.jobId,
+			input.nodeId,
+			input.outputKey,
+			input.filename,
+			input.subfolder,
+			input.type,
+			now,
+			now,
+		);
+		const row = this.db.prepare("SELECT * FROM assets WHERE id = ?").get(input.id) as AssetRow | null;
+		if (!row) throw new Error("Output asset intent was not persisted");
+		return assetFromRow(row);
+	}
+
+	markOutputAssetPending(id: string): AssetMetadata {
+		return this.updateAsset(id, `
+			UPDATE assets SET status = 'pending', sha256 = NULL, bytes = NULL, updated_at = ?
+			WHERE id = ? AND origin = 'output'
+		`, [this.now(), id]);
+	}
+
+	finishOutputAssetArchive(id: string, input: { sha256: string; bytes: number; contentType: string }): AssetMetadata {
+		return this.updateAsset(id, `
+			UPDATE assets SET status = 'ready', sha256 = ?, bytes = ?, content_type = ?, updated_at = ?
+			WHERE id = ? AND origin = 'output'
+		`, [input.sha256, input.bytes, input.contentType, this.now(), id]);
+	}
+
+	listAssets(options: { limit: number; offset: number; jobId?: string }): { assets: AssetMetadata[]; total: number } {
+		const rows = options.jobId
+			? this.db.prepare("SELECT * FROM assets WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
+				.all(options.jobId, options.limit, options.offset) as AssetRow[]
+			: this.db.prepare("SELECT * FROM assets ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
+				.all(options.limit, options.offset) as AssetRow[];
+		const count = options.jobId
+			? this.db.prepare("SELECT COUNT(*) AS count FROM assets WHERE job_id = ?").get(options.jobId) as { count: number }
+			: this.db.prepare("SELECT COUNT(*) AS count FROM assets").get() as { count: number };
+		return { assets: rows.map(assetFromRow), total: count.count };
+	}
+
+	listJobAssets(jobId: string): AssetMetadata[] {
+		const rows = this.db.prepare("SELECT * FROM assets WHERE job_id = ? ORDER BY node_id, id").all(jobId) as AssetRow[];
+		return rows.map(assetFromRow);
+	}
+
+	listPendingOutputAssets(): AssetMetadata[] {
+		const rows = this.db.prepare(`
+			SELECT * FROM assets WHERE origin = 'output' AND status = 'pending'
+			ORDER BY created_at ASC, id ASC
+		`).all() as AssetRow[];
+		return rows.map(assetFromRow);
+	}
+
+	assetContentPath(asset: AssetMetadata): string | null {
+		if (!asset.storageName) return null;
+		assertStorageName(asset.storageName);
+		const root = asset.origin === "input" ? this.inputAssetsDir : this.outputAssetsDir;
+		return join(root, asset.storageName);
+	}
+
+	private updateAsset(id: string, sql: string, params: unknown[]): AssetMetadata {
+		const result = this.db.prepare(sql).run(...params as never[]);
+		if (result.changes === 0) {
+			const row = this.db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow | null;
+			if (!row) throw new Error("Asset record disappeared before it could be updated");
+			return assetFromRow(row);
+		}
+		const row = this.db.prepare("SELECT * FROM assets WHERE id = ?").get(id) as AssetRow | null;
+		if (!row) throw new Error("Updated asset could not be read");
+		return assetFromRow(row);
+	}
+
 	beginJobSubmission(input: {
 		promptId: string;
 		workflowId: string;
@@ -534,5 +898,20 @@ export function validateApiWorkflow(value: unknown): asserts value is Record<str
 		if (!record.inputs || typeof record.inputs !== "object" || Array.isArray(record.inputs)) {
 			throw new HttpError(400, "invalid_workflow_format", `Workflow node ${nodeId} is missing an inputs object`);
 		}
+	}
+}
+
+function isAssetId(id: string): boolean {
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)
+		|| /^out_[a-f0-9]{64}$/.test(id);
+}
+
+function assertAssetId(id: string): void {
+	if (!isAssetId(id)) throw new Error("Invalid asset id");
+}
+
+function assertStorageName(name: string): void {
+	if (!/^[a-z0-9_-]{1,80}(?:\.[a-z0-9]{1,12})?$/.test(name)) {
+		throw new Error("Invalid stored asset name");
 	}
 }

@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { unlink } from "node:fs/promises";
+import { stat, unlink } from "node:fs/promises";
 import type { HubConfig } from "./config.ts";
 import { isAllowedRequestHost } from "./config.ts";
+import { AssetService } from "./assets.ts";
 import { ComfyApiClient } from "./comfy-client.ts";
 import { ComfyUpstreamError, HttpError } from "./errors.ts";
 import { JobService } from "./jobs.ts";
 import { streamMultipartFile } from "./multipart.ts";
-import { HubStore } from "./storage.ts";
+import { type AssetMetadata, HubStore } from "./storage.ts";
 
 const JSON_BODY_LIMIT = 16 * 1024;
 
@@ -68,6 +69,36 @@ function parseMetadata(value: unknown): { uploadId: string; name?: string | null
 	const name = parseOptionalText(body.name, "name", 200);
 	const description = parseOptionalText(body.description, "description", 2000);
 	return { uploadId: body.upload_id, ...(name !== undefined ? { name } : {}), ...(description !== undefined ? { description } : {}) };
+}
+
+function parseAssetUpload(value: unknown): { uploadId: string; kind: "image" | "mask"; originalAssetId: string | null } {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new HttpError(400, "invalid_request", "Request body must be an object");
+	}
+	const body = value as Record<string, unknown>;
+	for (const key of Object.keys(body)) {
+		if (!["upload_id", "kind", "original_asset_id"].includes(key)) throw new HttpError(400, "invalid_request", `Unknown field: ${key}`);
+	}
+	if (typeof body.upload_id !== "string" || !/^[0-9a-f-]{36}$/.test(body.upload_id)) {
+		throw new HttpError(400, "invalid_upload_id", "upload_id must be a UUID");
+	}
+	if (body.kind !== "image" && body.kind !== "mask") throw new HttpError(400, "invalid_asset_kind", "kind must be image or mask");
+	let originalAssetId: string | null = null;
+	if (body.original_asset_id !== undefined) {
+		if (typeof body.original_asset_id !== "string"
+			|| !(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(body.original_asset_id)
+				|| /^out_[a-f0-9]{64}$/.test(body.original_asset_id))) {
+			throw new HttpError(400, "invalid_original_asset", "original_asset_id must identify an image asset");
+		}
+		originalAssetId = body.original_asset_id;
+	}
+	if (body.kind === "mask" && originalAssetId === null) {
+		throw new HttpError(400, "original_asset_required", "original_asset_id is required for a mask");
+	}
+	if (body.kind === "image" && originalAssetId !== null) {
+		throw new HttpError(400, "invalid_request", "original_asset_id is only valid for masks");
+	}
+	return { uploadId: body.upload_id, kind: body.kind, originalAssetId };
 }
 
 function parseJobSubmission(value: unknown): { workflowId: string; metadata: Record<string, unknown>; clientRequestId: string | null } {
@@ -201,9 +232,21 @@ export interface HubRequestServer {
 
 export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAppOptions): {
 	fetch: (request: Request, server?: HubRequestServer) => Promise<Response>;
+	close: () => Promise<void>;
 } {
-	const jobs = suppliedJobs ?? new JobService({ store, comfy });
+	const assets = new AssetService({
+		store,
+		comfy,
+		maxAssetBytes: config.maxAssetBytes,
+		maxOutputBytes: config.maxOutputBytes,
+		maxConcurrentArchives: config.maxConcurrentArchives,
+		transferIdleTimeoutMs: config.transferIdleTimeoutMs,
+	});
+	const jobs = suppliedJobs ?? new JobService({ store, comfy, assets });
+	jobs.attachAssetService(assets);
+	assets.start();
 	return {
+		close: () => assets.close(),
 		async fetch(request: Request, server?: HubRequestServer): Promise<Response> {
 			try {
 				const url = new URL(request.url);
@@ -240,6 +283,33 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 					} finally {
 						store.finishStaging(uploadId);
 					}
+				}
+
+				if (request.method === "POST" && path === "/api/v1/assets") {
+					const input = parseAssetUpload(await readJsonBody(request));
+					const result = await assets.upload(input, request.signal);
+					return jsonResponse(await assetResponse(result.asset, request, store), result.statusCode);
+				}
+
+				if (request.method === "GET" && path === "/api/v1/assets") {
+					const limit = parsePositiveQuery(url.searchParams.get("limit"), 50, 100, "limit");
+					const offset = parseOffsetQuery(url.searchParams.get("offset"));
+					const jobIdValue = url.searchParams.get("job_id");
+					const jobId = jobIdValue === null ? undefined : decodeJobId(jobIdValue);
+					const page = store.listAssets({ limit, offset, ...(jobId ? { jobId } : {}) });
+					return jsonResponse({
+						assets: await Promise.all(page.assets.map((asset) => assetResponse(asset, request, store))),
+						pagination: { limit, offset, total: page.total, has_more: offset + page.assets.length < page.total },
+					});
+				}
+
+				const assetMatch = /^\/api\/v1\/assets\/([^/]+)(?:\/(content))?$/.exec(path);
+				if (request.method === "GET" && assetMatch) {
+					const id = decodePathSegment(assetMatch[1]!);
+					const asset = store.getAsset(id);
+					if (!asset) throw new HttpError(404, "asset_not_found", "Asset not found");
+					if (assetMatch[2] === "content") return await streamAssetContent(request, asset, store);
+					return jsonResponse(await assetResponse(asset, request, store));
 				}
 
 				if (request.method === "POST" && path === "/api/v1/workflows") {
@@ -342,4 +412,115 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs }: HubAp
 			}
 		},
 	};
+}
+
+async function assetResponse(asset: AssetMetadata, request: Request, store: HubStore): Promise<Record<string, unknown>> {
+	const contentPath = store.assetContentPath(asset);
+	let contentAvailable = false;
+	let status = asset.status;
+	if (contentPath) {
+		try {
+			const info = await stat(contentPath);
+			contentAvailable = info.isFile() && info.size === asset.bytes
+				&& (asset.origin === "input" || asset.status === "ready");
+		} catch {
+			contentAvailable = false;
+		}
+	}
+	if (asset.origin === "output" && asset.status === "ready" && !contentAvailable) status = "pending";
+	const workflowValue = asset.origin === "input" && status === "ready" && asset.comfyFilename !== null
+		? asset.comfySubfolder ? `${asset.comfySubfolder}/${asset.comfyFilename}` : asset.comfyFilename
+		: null;
+	const contentUrl = contentAvailable
+		? new URL(`/api/v1/assets/${encodeURIComponent(asset.id)}/content`, request.url).toString()
+		: null;
+	return {
+		asset_id: asset.id,
+		kind: asset.kind,
+		origin: asset.origin,
+		status,
+		sha256: asset.sha256,
+		bytes: asset.bytes,
+		content_type: asset.contentType,
+		original_filename: asset.originalFilename,
+		original_asset_id: asset.originalAssetId,
+		filename: asset.comfyFilename ?? asset.originalFilename,
+		subfolder: asset.comfySubfolder,
+		type: asset.comfyType,
+		comfy: asset.comfyFilename === null ? null : {
+			filename: asset.comfyFilename,
+			subfolder: asset.comfySubfolder,
+			type: asset.comfyType,
+		},
+		workflow_value: workflowValue,
+		job_id: asset.jobId,
+		node_id: asset.nodeId,
+		output_key: asset.outputKey,
+		download_url: contentUrl,
+		created_at: new Date(asset.createdAt).toISOString(),
+		updated_at: new Date(asset.updatedAt).toISOString(),
+	};
+}
+
+async function streamAssetContent(request: Request, asset: AssetMetadata, store: HubStore): Promise<Response> {
+	const path = store.assetContentPath(asset);
+	if (!path) throw new HttpError(404, "asset_content_not_found", "Asset content is not available");
+	let info;
+	try {
+		info = await stat(path);
+	} catch {
+		throw new HttpError(404, "asset_content_not_found", "Asset content is not available");
+	}
+	if (!info.isFile() || (asset.origin === "output" && (asset.status !== "ready" || info.size !== asset.bytes))) {
+		throw new HttpError(404, "asset_content_not_ready", "Archived output content is not ready");
+	}
+	const size = info.size;
+	const rangeHeader = request.headers.get("range");
+	const range = rangeHeader === null ? null : parseByteRange(rangeHeader, size);
+	if (rangeHeader !== null && range === null) {
+		return new Response(null, { status: 416, headers: { "content-range": `bytes */${size}`, "accept-ranges": "bytes", "cache-control": "private, no-store" } });
+	}
+	const start = range?.start ?? 0;
+	const end = range?.end ?? Math.max(0, size - 1);
+	const length = size === 0 ? 0 : end - start + 1;
+	const headers = new Headers({
+		"content-type": safeContentType(asset.contentType),
+		"content-length": String(length),
+		"content-disposition": `attachment; filename="asset-${asset.id}${safeStoredExtension(asset.storageName)}"`,
+		"x-content-type-options": "nosniff",
+		"accept-ranges": "bytes",
+		"cache-control": "private, no-store",
+	});
+	if (range) headers.set("content-range", `bytes ${start}-${end}/${size}`);
+	const file = Bun.file(path);
+	const body = size === 0 ? new Uint8Array() : file.slice(start, end + 1);
+	return new Response(body, { status: range ? 206 : 200, headers });
+}
+
+function parseByteRange(value: string, size: number): { start: number; end: number } | null {
+	const match = /^bytes=(\d*)-(\d*)$/.exec(value.trim());
+	if (!match || (!match[1] && !match[2]) || size <= 0) return null;
+	let start: number;
+	let end: number;
+	if (!match[1]) {
+		const suffixLength = Number(match[2]);
+		if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
+		start = Math.max(0, size - suffixLength);
+		end = size - 1;
+	} else {
+		start = Number(match[1]);
+		end = match[2] ? Number(match[2]) : size - 1;
+		if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || start >= size) return null;
+		end = Math.min(end, size - 1);
+	}
+	return { start, end };
+}
+
+function safeContentType(value: string | null): string {
+	return value && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(value) ? value : "application/octet-stream";
+}
+
+function safeStoredExtension(storageName: string | null): string {
+	const extension = storageName?.match(/(\.[a-z0-9]{1,12})$/i)?.[1] ?? "";
+	return extension;
 }

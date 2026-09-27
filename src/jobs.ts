@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ComfyJob, ComfyJobStatus } from "./comfy-client.ts";
 import type { ComfyApiClient } from "./comfy-client.ts";
 import { ComfyPromptRejectedError, ComfyUpstreamError, HttpError } from "./errors.ts";
+import type { AssetService } from "./assets.ts";
 import { type HubStore, type JobSubmission, type JobSubmissionState } from "./storage.ts";
 
 const UPSTREAM_PAGE_SIZE = 100;
@@ -40,12 +41,18 @@ export class JobService {
 	private readonly comfy: ComfyApiClient;
 	private readonly pollIntervalMs: number;
 	private readonly now: () => number;
+	private assets: AssetService | undefined;
 
-	constructor(options: { store: HubStore; comfy: ComfyApiClient; pollIntervalMs?: number; now?: () => number }) {
+	constructor(options: { store: HubStore; comfy: ComfyApiClient; assets?: AssetService; pollIntervalMs?: number; now?: () => number }) {
 		this.store = options.store;
 		this.comfy = options.comfy;
+		this.assets = options.assets;
 		this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
 		this.now = options.now ?? Date.now;
+	}
+
+	attachAssetService(assets: AssetService): void {
+		this.assets = assets;
 	}
 
 	async submit(input: JobSubmitInput, signal?: AbortSignal): Promise<JobSubmitResult> {
@@ -136,6 +143,9 @@ export class JobService {
 		jobs.sort((a, b) => numericField(b, "create_time") - numericField(a, "create_time"));
 		const total = jobs.length;
 		const page = jobs.slice(options.offset, options.offset + options.limit);
+		for (let index = 0; index < page.length; index += 3) {
+			await Promise.all(page.slice(index, index + 3).map((job) => this.archiveCompletedOutputs(job, options.signal)));
+		}
 		return {
 			jobs: page,
 			pagination: {
@@ -152,6 +162,7 @@ export class JobService {
 		const submission = this.store.getJobSubmission(promptId);
 		try {
 			const job = await this.getUpstreamJob(promptId, signal);
+			await this.archiveCompletedOutputs(job, signal);
 			return submission ? addLocalMapping(job, this.reconcileSubmission(submission)) : job;
 		} catch (error) {
 			if (!(error instanceof HttpError) || error.code !== "job_not_found") throw error;
@@ -289,6 +300,22 @@ export class JobService {
 		const fromQueue = await this.getQueuedJob(promptId, signal);
 		if (fromQueue) return fromQueue;
 		throw new HttpError(404, "job_not_found", "ComfyUI job not found");
+	}
+
+	private async archiveCompletedOutputs(job: ComfyJob, signal?: AbortSignal): Promise<void> {
+		if (!this.assets || job.status !== "completed") return;
+		try {
+			const history = await this.comfy.getHistory(job.id, signal);
+			if (!isRecord(history) || !isRecord(history[job.id])) return;
+			const item = history[job.id] as Record<string, unknown>;
+			const status = isRecord(item.status) ? item.status.status_str : undefined;
+			if (status !== "success") return;
+			await this.assets.archiveCompletedJob(job.id, item.outputs);
+		} catch (error) {
+			if (signal?.aborted) throw signal.reason ?? error;
+			// Output discovery and archival are recoverable side effects. The job
+			// snapshot remains useful, and another get/list retries the pending asset.
+		}
 	}
 
 	private async getHistoryJob(promptId: string, signal?: AbortSignal): Promise<ComfyJob | null> {

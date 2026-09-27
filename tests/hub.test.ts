@@ -294,7 +294,7 @@ describe("workflow staging and immutable storage", () => {
 		const migrated = new HubStore({ dataDir: legacyDir, uploadTtlMs: config.uploadTtlMs });
 		expect(migrated.getWorkflow(digest)?.name).toBe("Legacy");
 		expect(migrated.getWorkflow(digest)?.filename).toBeNull();
-		expect((migrated.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+		expect((migrated.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(4);
 		migrated.close();
 	});
 
@@ -323,7 +323,7 @@ describe("workflow staging and immutable storage", () => {
 
 		const migrated = new HubStore({ dataDir: legacyDir, uploadTtlMs: config.uploadTtlMs });
 		expect(migrated.getWorkflow(digest)?.filename).toBe("persisted.json");
-		expect((migrated.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
+		expect((migrated.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(4);
 		expect(migrated.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'job_submissions'").get()).toBeTruthy();
 		expect(migrated.clientId).toMatch(/^[0-9a-f-]{36}$/);
 		migrated.close();

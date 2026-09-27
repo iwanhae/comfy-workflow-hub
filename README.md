@@ -1,9 +1,9 @@
 # Comfy workflow hub
 
 A Bun/TypeScript service for sharing immutable ComfyUI API-format workflows,
-proxying discovery, and durably submitting/tracking ComfyUI jobs. SQLite records
-live under `DATA_DIR` (default: `./data`) and workflow bytes are content-addressed.
-Job execution uses ComfyUI's REST API; MCP, UI, and asset promotion are later work.
+promoting input images/masks, archiving job outputs, proxying discovery, and
+durably submitting/tracking ComfyUI jobs. SQLite records live under `DATA_DIR`
+(default: `./data`) and workflow bytes are content-addressed.
 
 ## Run and test
 
@@ -17,8 +17,10 @@ bun run hub
 The hub listens on `127.0.0.1:3000` by default. Persistent state is kept in
 `./data/` and is ignored by git. SQLite uses WAL mode; workflow bytes live in
 `data/workflows/<sha256>.json`, and temporary multipart uploads live in
-`data/staging/` until consumed or expired. Run only one hub process per
-`DATA_DIR` (the hub does not provide distributed process coordination).
+`data/staging/` until consumed or expired. Original input assets live under
+`data/assets/inputs/`; archived job outputs live under `data/outputs/`. Run
+only one hub process per `DATA_DIR` (the hub does not provide distributed
+process coordination).
 In-process uploads/claims are protected from cleanup; after a restart, orphan
 staging files and interrupted claims are recovered after a conservative
 24-hour grace period. That grace makes an accidental overlapping process
@@ -36,6 +38,10 @@ Environment settings:
 | `COMFY_BASE_URL` | `http://127.0.0.1:8188` | ComfyUI upstream origin for discovery and jobs |
 | `COMFY_ALLOW_LAN` | `false` | Required for a private-LAN ComfyUI upstream |
 | `MAX_UPLOAD_BYTES` | `52428800` | Maximum staged multipart file size (50 MiB) |
+| `MAX_ASSET_BYTES` | `MAX_UPLOAD_BYTES` | Maximum image/mask bytes promoted to ComfyUI |
+| `MAX_OUTPUT_BYTES` | `2147483648` | Maximum bytes archived for one job output (2 GiB) |
+| `MAX_CONCURRENT_ARCHIVES` | `2` | Global in-process limit on concurrent output transfers (max 16) |
+| `COMFY_TRANSFER_IDLE_TIMEOUT_MS` | `120000` | Maximum idle gap between streamed output chunks; not a total download deadline |
 | `MAX_WORKFLOW_BYTES` | `10485760` | Maximum workflow JSON size (10 MiB; cannot exceed upload limit) |
 | `UPLOAD_TTL_SECONDS` | `900` | One-time staged upload lifetime |
 | `COMFY_TIMEOUT_MS` | `30000` | Per-request ComfyUI upstream timeout (including submit/cancel) |
@@ -58,7 +64,11 @@ multipart bytes are streamed to disk under a short-lived one-time `upload_id`,
 then `POST /workflows` atomically claims that ID, validates the staged bytes as
 ComfyUI API-format JSON, and commits the immutable workflow. Job submission
 references that stored `workflow_id`; clients cannot submit arbitrary inline
-workflow JSON through the hub.
+workflow JSON through the hub. Image and mask bytes use the same staging route,
+then `POST /assets` promotes them through ComfyUI's v1 upload endpoints and
+stores the original bytes locally. The returned `workflow_value` is intended for
+the caller to put into a locally edited API workflow before uploading that
+workflow; the hub never edits a workflow graph.
 
 ```sh
 # Stage a workflow file on this hub. Only the `file` multipart field is accepted.
@@ -69,9 +79,23 @@ curl -X POST http://127.0.0.1:3000/api/v1/workflows \
   -H 'content-type: application/json' \
   -d '{"upload_id":"<returned-upload-id>","name":"My workflow","description":"Optional notes"}'
 
+# Stage an input image, then promote the staged id as a ComfyUI input asset.
+curl -F 'file=@portrait.png;type=image/png' http://127.0.0.1:3000/api/v1/uploads
+curl -X POST http://127.0.0.1:3000/api/v1/assets \
+  -H 'content-type: application/json' \
+  -d '{"upload_id":"<returned-upload-id>","kind":"image"}'
+# The response includes asset_id, filename, subfolder, type, and workflow_value.
+# Set that value in the relevant workflow input locally, then stage/upload the
+# resulting API-format workflow as above. Masks require original_asset_id:
+# {"upload_id":"...","kind":"mask","original_asset_id":"<image-asset-id>"}
+
 curl http://127.0.0.1:3000/api/v1/workflows
 curl http://127.0.0.1:3000/api/v1/workflows/<sha256-id>
 curl http://127.0.0.1:3000/api/v1/workflows/<sha256-id>/content
+curl 'http://127.0.0.1:3000/api/v1/assets?limit=50&offset=0'
+curl 'http://127.0.0.1:3000/api/v1/assets?job_id=<job-uuid>'
+curl http://127.0.0.1:3000/api/v1/assets/<asset-id>
+curl -H 'Range: bytes=0-1023' http://127.0.0.1:3000/api/v1/assets/<asset-id>/content
 
 # Submit the immutable workflow, optionally with metadata and a retry-safe request key.
 curl -X POST http://127.0.0.1:3000/api/v1/jobs \
@@ -89,6 +113,10 @@ curl -X POST http://127.0.0.1:3000/api/v1/jobs/<job-uuid>/cancel
 | `GET /health` | Hub liveness |
 | `GET /api/v1/status` | Hub status and stored workflow count |
 | `POST /api/v1/uploads` | Stream one multipart `file` field to staging; returns UUID, digest, size, expiry |
+| `POST /api/v1/assets` | Promote `{"upload_id":"...","kind":"image"}` or a mask with required `original_asset_id`; returns the exact ComfyUI reference and `workflow_value` |
+| `GET /api/v1/assets?limit=50&offset=0&job_id=<uuid>` | Paginated input/output asset metadata; optional job filter |
+| `GET /api/v1/assets/:id` | Asset metadata and a fresh same-origin `download_url` when local bytes are available |
+| `GET /api/v1/assets/:id/content` | Stream archived/original bytes; supports one byte range and `206`/`416` responses |
 | `POST /api/v1/workflows` | Claim `{"upload_id":"...","name?":"...","description?":"..."}`; validate and commit/deduplicate |
 | `GET /api/v1/workflows?limit=50&offset=0` | Workflow metadata page |
 | `GET /api/v1/workflows/:sha256` | Metadata plus parsed workflow object |
@@ -184,14 +212,40 @@ filename because it was not retained previously.
 
 Multipart file data is written incrementally to a generated path in `staging/`
 with a size limit and streaming digest. Filenames are metadata only; they are
-never used as paths. The service supports staging arbitrary file bytes so a
-later milestone can add image/mask assets; only validated workflow JSON is
-promoted into the immutable workflow library in this milestone.
+never used as paths. The service supports staging arbitrary bytes, but asset
+promotion accepts only sniffed raster images (PNG, JPEG, WebP, GIF, BMP, TIFF)
+whose declared MIME type matches when one is supplied. The hub assigns unique
+generated ComfyUI names and subfolders rather than using client filenames as
+paths. Mask promotion requires a ready image `original_asset_id` and sends its
+exact ComfyUI reference as the `original_ref` multipart JSON field; source bytes
+(including any alpha channel) are preserved unchanged.
+
+An upstream upload with a lost/invalid response is recorded as `ambiguous` and
+returns `202`; retrying the same `upload_id` reports that record and never sends
+a second ComfyUI upload. Only a confirmed, validated ComfyUI response supplies a
+`workflow_value`. Input originals are durably stored under `assets/inputs/`.
+
+For completed jobs, the hub examines `/history/:job_id`, recognizes image,
+video, audio, and generic file references, and persists pending asset intents.
+Job get/list/wait only await this lightweight discovery; terminal job status is
+not delayed by large output downloads. A bounded background queue streams each
+`/view` response to a temporary file under `outputs/`, enforces the output size
+limit, syncs and renames the complete file, then marks the SQLite asset row
+`ready`. Until then, asset get/list reports `pending` with no download URL. A
+failed or interrupted archive stays pending and is retried on later history
+discovery or at startup from those durable intents; partial files are never
+exposed as ready assets. Output asset ids are deterministic for a
+job/node/file reference, so retries do not create duplicates. The metadata
+records `job_id` and `node_id` for filtering. The `/view` header timeout is
+separate from transfer idle timeout: long downloads may run beyond
+`COMFY_TIMEOUT_MS` as long as chunks continue arriving within
+`COMFY_TRANSFER_IDLE_TIMEOUT_MS`.
 
 The ComfyUI client has typed, bounded-timeout v1 job methods and makes no
-automatic POST retries. Tests use mocked Comfy HTTP and do not make network
-calls or generate media. Workflow file uploads to ComfyUI, MCP integration,
-React UI, and asset promotion are outside this milestone.
+automatic POST retries. Input asset uploads are streamed to `/upload/image` or
+`/upload/mask`; ambiguous outcomes are never automatically retried. Tests use
+mocked Comfy HTTP and do not make live uploads or generate media. MCP
+integration and the React UI are outside this milestone.
 
 ## Existing smoke runner
 

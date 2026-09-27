@@ -9,6 +9,10 @@ export interface HubConfig {
 	comfyBaseUrl: URL;
 	comfyAllowLan: boolean;
 	maxUploadBytes: number;
+	maxAssetBytes: number;
+	maxOutputBytes: number;
+	maxConcurrentArchives: number;
+	transferIdleTimeoutMs: number;
 	maxWorkflowBytes: number;
 	uploadTtlMs: number;
 	upstreamTimeoutMs: number;
@@ -17,6 +21,7 @@ export interface HubConfig {
 type Env = Record<string, string | undefined>;
 
 const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const DEFAULT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_WORKFLOW_BYTES = 10 * 1024 * 1024;
 
 function envBoolean(env: Env, name: string, fallback = false): boolean {
@@ -109,6 +114,11 @@ export function loadConfig(env: Env = process.env, cwd = process.cwd()): HubConf
 	validateComfyUrl(comfyBaseUrl, comfyAllowLan);
 
 	const maxUploadBytes = positiveInteger(env, "MAX_UPLOAD_BYTES", DEFAULT_MAX_UPLOAD_BYTES);
+	const maxAssetBytes = positiveInteger(env, "MAX_ASSET_BYTES", maxUploadBytes);
+	const maxOutputBytes = positiveInteger(env, "MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT_BYTES);
+	const maxConcurrentArchives = positiveInteger(env, "MAX_CONCURRENT_ARCHIVES", 2);
+	if (maxConcurrentArchives > 16) throw new Error("MAX_CONCURRENT_ARCHIVES must be between 1 and 16");
+	const transferIdleTimeoutMs = positiveInteger(env, "COMFY_TRANSFER_IDLE_TIMEOUT_MS", 120_000);
 	const maxWorkflowBytes = positiveInteger(env, "MAX_WORKFLOW_BYTES", DEFAULT_MAX_WORKFLOW_BYTES);
 	if (maxWorkflowBytes > maxUploadBytes) {
 		throw new Error("MAX_WORKFLOW_BYTES cannot exceed MAX_UPLOAD_BYTES");
@@ -122,6 +132,10 @@ export function loadConfig(env: Env = process.env, cwd = process.cwd()): HubConf
 		comfyBaseUrl,
 		comfyAllowLan,
 		maxUploadBytes,
+		maxAssetBytes,
+		maxOutputBytes,
+		maxConcurrentArchives,
+		transferIdleTimeoutMs,
 		maxWorkflowBytes,
 		uploadTtlMs: positiveInteger(env, "UPLOAD_TTL_SECONDS", 15 * 60) * 1000,
 		upstreamTimeoutMs: positiveInteger(env, "COMFY_TIMEOUT_MS", 30_000),

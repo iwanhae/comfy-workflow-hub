@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { ComfyPromptRejectedError, ComfyUpstreamError } from "./errors.ts";
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -33,6 +34,22 @@ export interface ComfyPromptRequest {
 	client_id: string;
 	prompt_id: string;
 	extra_data: Record<string, unknown>;
+}
+
+export interface ComfyFileReference {
+	filename: string;
+	subfolder: string;
+	type: string;
+}
+
+export interface ComfyInputUpload {
+	path: string;
+	filename: string;
+	subfolder: string;
+	contentType: string;
+	bytes: number;
+	kind: "image" | "mask";
+	originalRef?: ComfyFileReference;
 }
 
 export class ComfyApiClient {
@@ -96,6 +113,71 @@ export class ComfyApiClient {
 
 	getHistory(id: string, signal?: AbortSignal): Promise<unknown> {
 		return this.get(`/history/${encodeURIComponent(this.validatePathId(id))}`, signal);
+	}
+
+	async uploadInputAsset(input: ComfyInputUpload, signal?: AbortSignal): Promise<ComfyFileReference> {
+		const boundary = `comfy-hub-${randomUUID()}`;
+		const fields: Array<[string, string]> = [
+			["type", "input"],
+			["subfolder", input.subfolder],
+			["overwrite", "false"],
+		];
+		if (input.kind === "mask") {
+			if (!input.originalRef) throw new Error("A ComfyUI mask upload requires an original image reference");
+			fields.push(["original_ref", JSON.stringify(input.originalRef)]);
+		}
+		const multipart = createMultipartStream({ boundary, path: input.path, filename: input.filename, contentType: input.contentType, bytes: input.bytes, fields });
+		const url = input.kind === "mask" ? "/upload/mask" : "/upload/image";
+		const result = await this.request(url, {
+			method: "POST",
+			headers: {
+				"content-type": `multipart/form-data; boundary=${boundary}`,
+				"content-length": String(multipart.contentLength),
+				accept: "application/json",
+			},
+			body: multipart.body,
+			redirect: "error",
+		}, signal);
+		if (!isRecord(result)
+			|| typeof result.name !== "string"
+			|| typeof result.subfolder !== "string"
+			|| typeof result.type !== "string") {
+			throw new ComfyUpstreamError(502, "ComfyUI returned an invalid asset upload reference");
+		}
+		return { filename: result.name, subfolder: result.subfolder, type: result.type };
+	}
+
+	async getView(ref: ComfyFileReference, signal?: AbortSignal): Promise<Response> {
+		const query = new URLSearchParams({ filename: ref.filename, subfolder: ref.subfolder, type: ref.type });
+		const path = `/view?${query.toString()}`;
+		const headerController = new AbortController();
+		const headerTimer = setTimeout(() => {
+			headerController.abort(new DOMException("ComfyUI output headers timed out", "TimeoutError"));
+		}, this.timeoutMs);
+		const requestSignal = signal ? AbortSignal.any([signal, headerController.signal]) : headerController.signal;
+		let response: Response;
+		try {
+			const url = new URL(path.replace(/^\//, ""), this.baseUrl);
+			response = await this.fetchImpl(url, {
+				method: "GET",
+				headers: { accept: "*/*" },
+				signal: requestSignal,
+				redirect: "error",
+			});
+		} catch (error) {
+			if (signal?.aborted) throw signal.reason ?? error;
+			if (headerController.signal.aborted || (error instanceof Error && error.name === "TimeoutError")) {
+				throw new ComfyUpstreamError(504, "ComfyUI output headers timed out");
+			}
+			throw new ComfyUpstreamError(502, error instanceof Error ? error.message : "ComfyUI output download failed");
+		} finally {
+			clearTimeout(headerTimer);
+		}
+		if (!response.ok) {
+			const message = await readResponsePreview(response, 2048).catch(() => "");
+			throw new ComfyUpstreamError(response.status, message.slice(0, 2048) || response.statusText);
+		}
+		return response;
 	}
 
 	getSystemStats(signal?: AbortSignal): Promise<unknown> {
@@ -187,4 +269,109 @@ function serializePromptRequest(body: ComfyPromptRequest): string {
 		}
 	}
 	return `{"prompt":${promptJson},"client_id":${JSON.stringify(body.client_id)},"prompt_id":${JSON.stringify(body.prompt_id)},"extra_data":${JSON.stringify(body.extra_data)}}`;
+}
+
+function createMultipartStream(input: {
+	boundary: string;
+	path: string;
+	filename: string;
+	contentType: string;
+	bytes: number;
+	fields: Array<[string, string]>;
+}): { body: ReadableStream<Uint8Array>; contentLength: number } {
+	const fileHeader = Buffer.from(
+		`--${input.boundary}\r\nContent-Disposition: form-data; name="image"; filename="${input.filename}"\r\nContent-Type: ${input.contentType}\r\n\r\n`,
+		"utf8",
+	);
+	const fieldParts = input.fields.map(([name, value]) => Buffer.from(
+		`\r\n--${input.boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}`,
+		"utf8",
+	));
+	const closing = Buffer.from(`\r\n--${input.boundary}--\r\n`, "ascii");
+	const contentLength = fileHeader.byteLength + input.bytes + fieldParts.reduce((sum, part) => sum + part.byteLength, 0) + closing.byteLength;
+	const reader = Bun.file(input.path).stream().getReader();
+	let state: "header" | "file" | "fields" | "closing" | "done" = "header";
+	let fieldIndex = 0;
+	let readerReleased = false;
+	const body = new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			if (state === "header") {
+				state = "file";
+				controller.enqueue(fileHeader);
+				return;
+			}
+			if (state === "file") {
+				const next = await reader.read();
+				if (!next.done) {
+					controller.enqueue(next.value);
+					return;
+				}
+				reader.releaseLock();
+				readerReleased = true;
+				state = "fields";
+			}
+			if (state === "fields") {
+				if (fieldIndex < fieldParts.length) {
+					controller.enqueue(fieldParts[fieldIndex++]!);
+					return;
+				}
+				state = "closing";
+			}
+			if (state === "closing") {
+				state = "done";
+				controller.enqueue(closing);
+				return;
+			}
+			controller.close();
+		},
+		async cancel(reason) {
+			if (!readerReleased) {
+				await reader.cancel(reason).catch(() => undefined);
+				reader.releaseLock();
+				readerReleased = true;
+			}
+		},
+	});
+	return { body, contentLength };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function readResponsePreview(response: Response, maxBytes: number, timeoutMs = 2_000): Promise<string> {
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	let timedOut = false;
+	let timer: ReturnType<typeof setTimeout>;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => {
+			timedOut = true;
+			reject(new DOMException("ComfyUI error response body timed out", "TimeoutError"));
+		}, timeoutMs);
+	});
+	try {
+		while (total < maxBytes) {
+			const next = await Promise.race([reader.read(), timeout]);
+			if (next.done) break;
+			const piece = next.value.subarray(0, maxBytes - total);
+			chunks.push(piece);
+			total += piece.byteLength;
+			if (piece.byteLength !== next.value.byteLength) break;
+		}
+		if (total >= maxBytes) await reader.cancel("error preview limit reached").catch(() => undefined);
+	} catch (error) {
+		if (!timedOut) throw error;
+		void reader.cancel(error).catch(() => undefined);
+	} finally {
+		clearTimeout(timer!);
+		try {
+			reader.releaseLock();
+		} catch {
+			// A timed-out read may still be unwinding after cancellation.
+		}
+	}
+	return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total));
 }
