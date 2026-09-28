@@ -1,0 +1,8 @@
+.git
+node_modules
+data
+outputs
+web/dist
+coverage
+*.tsbuildinfo
+.env*

@@ -32,6 +32,32 @@ traversal and outside-directory symlinks, and does not turn missing asset URLs
 into HTML. `bun run test:ui` runs the jsdom browser-flow tests; `bun run
 typecheck` checks both the Hub and browser TypeScript projects.
 
+### Docker (Hub + production UI)
+
+```sh
+docker build -t comfy-hub .
+docker run --name comfy-hub -p 127.0.0.1:3000:3000 \
+  -v comfy-hub-data:/app/data comfy-hub
+```
+
+Open `http://127.0.0.1:3000/` or check `/health`. The volume preserves the
+SQLite database, workflow files, staged inputs, and archived outputs across
+container restarts. Run only one container against a given data volume.
+
+The image binds inside the container to `0.0.0.0` so Docker port publishing
+works; **publish the port on host loopback as above**. The Hub has no
+authentication or Host/Origin checks, so do not publish it to an untrusted
+network.
+ComfyUI is a separate service: the default `COMFY_BASE_URL=127.0.0.1:8188`
+points inside the Hub container, not to the Docker host. If ComfyUI runs on
+another machine or container, pass its reachable address as
+`-e COMFY_BASE_URL=http://<host-or-ip>:8188`. Hostnames such as
+`host.docker.internal` and Docker Compose service names are accepted if they
+resolve inside the container. On Linux, host networking
+(`--network host`) can instead reach a host-local ComfyUI through the default
+loopback URL, but it also bypasses Docker's loopback-only port publishing;
+restrict access at the host firewall before using it.
+
 The WebUI is a shared, unauthenticated workspace surface (use only on a trusted
 network; see the security note below). It has no canvas editor or sign-in flow.
 The board shows Hub and external ComfyUI jobs, live SSE progress with fresh
