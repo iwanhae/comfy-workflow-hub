@@ -67,6 +67,7 @@ const imageAsset = {
 
 afterEach(() => {
 	cleanup();
+	dom.reconfigure({ url: "http://127.0.0.1:3000/" });
 	FakeEventSource.instances = [];
 	globalThis.fetch = originalFetch;
 });
@@ -216,6 +217,26 @@ describe("shared hub browser flows", () => {
 		expect(calls.some((call) => call.startsWith("POST /api/v1/workflows"))).toBe(true);
 		expect(calls.some((call) => call.startsWith("POST /api/v1/jobs"))).toBe(true);
 		await waitFor(() => expect(screen.getByRole("button", { name: "Cancel queued job" })).toBeTruthy());
+	});
+
+	test("upgrades same-host HTTP asset URLs on HTTPS pages without accepting another host", async () => {
+		dom.reconfigure({ url: "https://hub.example/assets" });
+		setFetch((url) => {
+			if (url.pathname === "/api/v1/status") return response({ ok: true, workflow_count: 0, comfy_configured: true });
+			if (url.pathname === "/api/v1/comfy/status") return response({ devices: [] });
+			if (url.pathname === "/api/v1/comfy/queue") return response({ queue_running: [], queue_pending: [] });
+			if (url.pathname === "/api/v1/jobs") return response({ jobs: [], pagination: { total: 0, has_more: false } });
+			if (url.pathname === "/api/v1/assets") return response({ assets: [
+				{ ...imageAsset, download_url: `http://hub.example/api/v1/assets/${imageAssetId}/content` },
+				{ ...imageAsset, asset_id: "55555555-5555-4555-8555-555555555555", download_url: "http://another.example/api/v1/assets/55555555-5555-4555-8555-555555555555/content" },
+			], pagination: { total: 2, offset: 0, has_more: false } });
+			throw new Error(`Unexpected test request: ${url.pathname}`);
+		});
+		render(<App />);
+		fireEvent.click(screen.getByRole("button", { name: "Assets" }));
+		const link = await screen.findByRole("link", { name: /Download original/ });
+		expect(link.getAttribute("href")).toBe(`https://hub.example/api/v1/assets/${imageAssetId}/content`);
+		expect(screen.getAllByRole("link", { name: /Download original/ })).toHaveLength(1);
 	});
 
 	test("refreshes a selected job from live status and archive polling without reselecting", async () => {

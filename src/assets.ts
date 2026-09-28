@@ -330,8 +330,14 @@ export async function assetResponse(asset: AssetMetadata, request: Request, stor
 	const workflowValue = asset.origin === "input" && status === "ready" && asset.comfyFilename !== null
 		? asset.comfySubfolder ? `${asset.comfySubfolder}/${asset.comfyFilename}` : asset.comfyFilename
 		: null;
+	const publicOrigin = new URL(request.url);
+	// TLS-terminating proxies send HTTP to Bun while clients use HTTPS.
+	// Only accept an exact HTTPS indication; never downgrade an HTTPS request.
+	if (publicOrigin.protocol === "http:" && request.headers.get("x-forwarded-proto")?.toLowerCase() === "https") {
+		publicOrigin.protocol = "https:";
+	}
 	const contentUrl = contentAvailable
-		? new URL(`/api/v1/assets/${encodeURIComponent(asset.id)}/content`, new URL(request.url).origin).toString()
+		? new URL(`/api/v1/assets/${encodeURIComponent(asset.id)}/content`, publicOrigin.origin).toString()
 		: null;
 	return {
 		asset_id: asset.id,

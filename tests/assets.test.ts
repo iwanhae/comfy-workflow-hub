@@ -89,6 +89,27 @@ async function promptly<T>(promise: Promise<T>, message: string, timeoutMs = 300
 }
 
 describe("input asset promotion", () => {
+	test("advertises HTTPS content URLs behind a TLS-terminating proxy", async () => {
+		app = createHubApp({ config, store, comfy: comfy(async () => json({ name: "image.png", subfolder: "comfy-hub/test", type: "input" })) });
+		const uploadId = await stage(pngBytes, "portrait.png");
+		const promoted = await promote(uploadId, "image");
+		const { asset_id } = await promoted.json() as { asset_id: string };
+		const url = `http://hub.example/api/v1/assets/${asset_id}`;
+		for (const suffix of ["", "/content"]) {
+			const result = await app.fetch(new Request(`${url}${suffix}`, { headers: { "x-forwarded-proto": "https" } }));
+			if (suffix) {
+				expect(result.status).toBe(200);
+				expect(new Uint8Array(await result.arrayBuffer())).toEqual(pngBytes);
+			} else {
+				expect((await result.json() as { download_url: string }).download_url).toBe(`https://hub.example/api/v1/assets/${asset_id}/content`);
+			}
+		}
+		const list = await app.fetch(new Request("http://hub.example/api/v1/assets", { headers: { "x-forwarded-proto": "https" } }));
+		expect((await list.json() as { assets: Array<{ download_url: string }> }).assets[0]?.download_url).toBe(`https://hub.example/api/v1/assets/${asset_id}/content`);
+		const invalid = await app.fetch(new Request(url, { headers: { "x-forwarded-proto": "https, http" } }));
+		expect((await invalid.json() as { download_url: string }).download_url).toMatch(/^http:\/\/hub\.example\//);
+	});
+
 	test("streams the staged image and mask through ComfyUI v1 multipart endpoints", async () => {
 		const calls: Array<{ path: string; body: string; headers: Headers }> = [];
 		const client = comfy(async (input, init) => {

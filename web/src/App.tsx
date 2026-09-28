@@ -1186,7 +1186,12 @@ function safeAssetUrl(value: string | null): string | null {
 	if (!value || typeof window === "undefined") return null;
 	try {
 		const url = new URL(value, window.location.href);
-		return url.origin === window.location.origin && url.pathname.startsWith("/api/v1/assets/") ? url.href : null;
+		if (!url.pathname.startsWith("/api/v1/assets/")) return null;
+		if (url.origin === window.location.origin) return url.href;
+		// Older/proxy responses may advertise HTTP despite an HTTPS page.
+		if (window.location.protocol === "https:" && url.protocol === "http:"
+			&& url.host === window.location.host) return `${window.location.origin}${url.pathname}${url.search}${url.hash}`;
+		return null;
 	} catch { return null; }
 }
 

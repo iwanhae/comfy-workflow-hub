@@ -286,6 +286,11 @@ describe("remote MCP over Streamable HTTP", () => {
 		expect((listed.assets as Array<{ asset_id: string }>)[0]?.asset_id).toBe(assetId);
 		const detail = toolValue(await callTool("asset_get", { asset_id: assetId }, 22));
 		expect(detail.download_url).toBe(downloadUrl);
+		const forwarded = { "x-forwarded-proto": "https" };
+		const secureDetail = toolValue(await callTool("asset_get", { asset_id: assetId }, 23, { headers: forwarded }));
+		expect(secureDetail.download_url).toBe(`https://127.0.0.1:3000/api/v1/assets/${assetId}/content`);
+		const secureList = toolValue(await callTool("asset_list", { limit: 10, offset: 0 }, 24, { headers: forwarded }));
+		expect((secureList.assets as Array<{ download_url: string }>)[0]?.download_url).toBe(secureDetail.download_url);
 		const content = await app.fetch(new Request(downloadUrl));
 		expect(content.status).toBe(200);
 		expect(new Uint8Array(await content.arrayBuffer())).toEqual(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));

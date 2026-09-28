@@ -60,6 +60,10 @@ restrict access at the host firewall before using it.
 
 The WebUI is a shared, unauthenticated workspace surface (use only on a trusted
 network; see the security note below). It has no canvas editor or sign-in flow.
+When serving HTTPS through a TLS-terminating reverse proxy, forward the public
+`Host` and set `X-Forwarded-Proto: https` so REST and MCP asset download URLs
+use HTTPS. Only expose the Hub to trusted clients/proxies; forwarded headers
+are not an authentication boundary.
 The board shows Hub and external ComfyUI jobs, live SSE progress with fresh
 snapshots after reconnect, and periodic REST refresh as a fallback. Job details
 include the saved workflow association, errors, output archive status, and
