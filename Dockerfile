@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
-COPY vite.config.ts ./
+COPY vite.config.ts tsconfig.json ./
 COPY web/ ./web/
 RUN bun run build
 
