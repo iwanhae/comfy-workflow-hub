@@ -68,22 +68,20 @@ describe("production UI static handler", () => {
 		expect(await response?.text()).toBe("");
 	});
 
-	test("guards LAN UI requests against untrusted Host and Origin headers", async () => {
+	test("serves UI for public hostnames and forwarded Host/Origin headers", async () => {
 		const { root } = await makeDist();
-		const serve = createUiStaticHandler(root, { allowLan: true });
+		const serve = createUiStaticHandler(root);
 		const url = "http://192.168.1.20:3000/";
 		const accepted = await serve(new Request(url, { headers: { host: "192.168.1.20:3000", origin: "http://192.168.1.20:3000" } }));
 		expect(accepted?.status).toBe(200);
 
 		const spoofedHost = await serve(new Request(url, { headers: { host: "attacker.example" } }));
-		expect(spoofedHost?.status).toBe(403);
-		expect(await spoofedHost?.json()).toMatchObject({ error: { code: "host_not_allowed" } });
+		expect(spoofedHost?.status).toBe(200);
 
 		const crossOrigin = await serve(new Request(url, { headers: { host: "192.168.1.20:3000", origin: "http://attacker.example" } }));
-		expect(crossOrigin?.status).toBe(403);
-		expect(await crossOrigin?.json()).toMatchObject({ error: { code: "origin_not_allowed" } });
+		expect(crossOrigin?.status).toBe(200);
 
 		const publicHost = await serve(new Request("http://attacker.example:3000/", { headers: { host: "attacker.example:3000" } }));
-		expect(publicHost?.status).toBe(403);
+		expect(publicHost?.status).toBe(200);
 	});
 });

@@ -328,21 +328,17 @@ describe("shared real-time job progress", () => {
 		expect(finalJob?.status).toBe("completed");
 	});
 
-	test("checks Origin and Host for SSE, removes aborted/cancelled subscribers, and closes sockets and timers on shutdown", async () => {
+	test("allows forwarded Origin and Host for SSE, removes aborted/cancelled subscribers, and closes sockets and timers on shutdown", async () => {
 		const app = makeApp();
-		const crossOrigin = await app.fetch(new Request("http://127.0.0.1:3000/api/v1/events", {
-			headers: { origin: "https://attacker.invalid" },
-		}));
-		expect(crossOrigin.status).toBe(403);
-		const wrongHost = await app.fetch(new Request("http://127.0.0.1:3000/api/v1/events", {
-			headers: { host: "attacker.invalid:3000" },
-		}));
-		expect(wrongHost.status).toBe(403);
-		const emptyOrigin = await app.fetch(new Request("http://127.0.0.1:3000/api/v1/events", {
-			headers: { origin: "" },
-		}));
-		expect(emptyOrigin.status).toBe(403);
-		expect(socketUrls).toHaveLength(0);
+		for (const headers of [
+			{ origin: "https://attacker.invalid" },
+			{ host: "attacker.invalid:3000" },
+			{ origin: "" },
+		]) {
+			const response = await app.fetch(new Request("http://127.0.0.1:3000/api/v1/events", { headers }));
+			expect(response.status).toBe(200);
+			await response.body?.cancel();
+		}
 
 		const controller = new AbortController();
 		const first = await openFeed(app, controller.signal);

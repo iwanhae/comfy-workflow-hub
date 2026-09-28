@@ -1,6 +1,5 @@
 import { realpath, readFile, stat } from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
-import { isAllowedRequestHost } from "./config.ts";
 
 const CONTENT_TYPES: Record<string, string> = {
 	".css": "text/css; charset=utf-8",
@@ -20,12 +19,8 @@ const CONTENT_TYPES: Record<string, string> = {
  * file falls back to index.html only for known UI routes and HTML navigations;
  * API, MCP, health, and unknown asset requests continue to the Hub handler.
  */
-export function createUiStaticHandler(
-	distDirectory: string,
-	options: { allowLan?: boolean } = {},
-): (request: Request) => Promise<Response | null> {
+export function createUiStaticHandler(distDirectory: string): (request: Request) => Promise<Response | null> {
 	const rootPath = resolve(distDirectory);
-	const allowLan = options.allowLan ?? false;
 	let rootPromise: Promise<string> | null = null;
 	const getRoot = () => rootPromise ??= realpath(rootPath);
 
@@ -37,9 +32,6 @@ export function createUiStaticHandler(
 		const decoded = decodePath(url.pathname);
 		if (decoded === null) return notFound(request.method);
 		if (isReservedHubPath(decoded)) return null;
-		const requestError = uiRequestError(request, allowLan);
-		if (requestError) return forbidden(request.method, requestError.code, requestError.message);
-
 		try {
 			const root = await getRoot();
 			const requestedRelative = decoded === "/" ? "index.html" : decoded.slice(1);
@@ -65,33 +57,6 @@ export function createUiStaticHandler(
 		}
 		return null;
 	};
-}
-
-function uiRequestError(request: Request, allowLan: boolean): { code: string; message: string } | null {
-	const url = new URL(request.url);
-	if (!isAllowedRequestHost(url.hostname, allowLan)) {
-		return { code: "host_not_allowed", message: "Request Host must be loopback or an explicitly enabled private-LAN address" };
-	}
-	const host = request.headers.get("host");
-	if (host !== null) {
-		try {
-			const hostUrl = new URL(`${url.protocol}//${host}`);
-			if (hostUrl.username || hostUrl.password || hostUrl.pathname !== "/" || hostUrl.search || hostUrl.hash || hostUrl.origin !== url.origin) {
-				throw new Error("host mismatch");
-			}
-		} catch {
-			return { code: "host_not_allowed", message: "Request Host must match the Hub request origin" };
-		}
-	}
-	const origin = request.headers.get("origin");
-	if (origin !== null) {
-		try {
-			if (new URL(origin).origin !== url.origin) throw new Error("origin mismatch");
-		} catch {
-			return { code: "origin_not_allowed", message: "Cross-origin UI requests are not allowed" };
-		}
-	}
-	return null;
 }
 
 function decodePath(pathname: string): string | null {
@@ -143,16 +108,5 @@ function notFound(method: string): Response {
 	return new Response(method === "HEAD" ? null : "Not found", {
 		status: 404,
 		headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" },
-	});
-}
-
-function forbidden(method: string, code: string, message: string): Response {
-	return new Response(method === "HEAD" ? null : JSON.stringify({ error: { code, message } }), {
-		status: 403,
-		headers: {
-			"content-type": "application/json; charset=utf-8",
-			"cache-control": "no-store",
-			"x-content-type-options": "nosniff",
-		},
 	});
 }

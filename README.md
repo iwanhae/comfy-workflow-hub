@@ -68,9 +68,7 @@ Environment settings:
 | `DATA_DIR` | `<cwd>/data` | SQLite and upload storage root |
 | `HUB_HOST` | `127.0.0.1` | Hub bind address |
 | `HUB_PORT` | `3000` | Hub HTTP port |
-| `HUB_ALLOW_LAN` | `false` | Required to bind the hub on a trusted private LAN (`0.0.0.0` or a private IP) |
 | `COMFY_BASE_URL` | `http://127.0.0.1:8188` | ComfyUI upstream origin for discovery and jobs |
-| `COMFY_ALLOW_LAN` | `false` | Required for a private-LAN ComfyUI upstream |
 | `MAX_UPLOAD_BYTES` | `52428800` | Maximum staged multipart file size (50 MiB) |
 | `MAX_ASSET_BYTES` | `MAX_UPLOAD_BYTES` | Maximum image/mask bytes promoted to ComfyUI |
 | `MAX_OUTPUT_BYTES` | `2147483648` | Maximum bytes archived for one job output (2 GiB) |
@@ -80,15 +78,13 @@ Environment settings:
 | `UPLOAD_TTL_SECONDS` | `900` | One-time staged upload lifetime |
 | `COMFY_TIMEOUT_MS` | `30000` | Per-request ComfyUI upstream timeout (including submit/cancel) |
 
-For a trusted LAN ComfyUI at `192.168.0.2:8188`, explicitly set
-`COMFY_BASE_URL=http://192.168.0.2:8188` and `COMFY_ALLOW_LAN=true`. For other
-agents on the LAN to reach this hub, also bind it explicitly, e.g.
-`HUB_HOST=0.0.0.0` and `HUB_ALLOW_LAN=true`. **The hub has no authentication**:
-any client that can reach a LAN-exposed instance can upload/read workflows,
-submit jobs, and dequeue pending jobs. Use only on a trusted network and apply
-network-level restrictions.
-No CORS is enabled; browser state-changing requests are same-origin checked.
-Public upstream hosts and public hub bind addresses are rejected.
+For a ComfyUI at `192.168.0.2:8188`, set
+`COMFY_BASE_URL=http://192.168.0.2:8188`. To listen beyond the local machine,
+set `HUB_HOST=0.0.0.0`. **The hub has no authentication or Host/Origin checks**:
+any client that can reach it can upload/read workflows, submit jobs, and
+dequeue pending jobs. Keep it behind a trusted network or an authenticating
+reverse proxy. No CORS headers are sent, but that is not an access control for
+non-browser clients or all browser requests.
 
 ## HTTP API
 
@@ -177,10 +173,10 @@ curl -N http://127.0.0.1:3000/api/v1/events
 
 The hub also exposes an MCP Streamable HTTP endpoint at `POST /mcp` using
 `@modelcontextprotocol/server` 2.1.0. It has no authentication, just like the
-REST API: it is loopback-only by default, and exposing it to a trusted private
-LAN requires `HUB_ALLOW_LAN=true` plus a non-loopback bind. Requests are checked
-against the allowed Host and, when present, Origin; no CORS access is granted.
-Do not expose this unauthenticated service to an untrusted network.
+REST API: it is loopback-only by default, and a non-loopback `HUB_HOST` bind
+exposes it to other clients. The Hub does not check Host or Origin headers and
+does not send CORS headers. Do not expose this unauthenticated service to an
+untrusted network.
 
 The MCP server advertises exactly these tools:
 

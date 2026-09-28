@@ -11,7 +11,7 @@ await store.initialize();
 
 const comfy = new ComfyApiClient({ baseUrl: config.comfyBaseUrl, timeoutMs: config.upstreamTimeoutMs });
 const app = createHubApp({ config, store, comfy });
-const serveUi = createUiStaticHandler(fileURLToPath(new URL("../web/dist/", import.meta.url)), { allowLan: config.hubAllowLan });
+const serveUi = createUiStaticHandler(fileURLToPath(new URL("../web/dist/", import.meta.url)));
 const server = Bun.serve({
 	hostname: config.host,
 	port: config.port,

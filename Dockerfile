@@ -21,8 +21,7 @@ RUN mkdir -p /app/data && chown -R bun:bun /app
 USER bun
 
 ENV DATA_DIR=/app/data \
-    HUB_HOST=0.0.0.0 \
-    HUB_ALLOW_LAN=true
+    HUB_HOST=0.0.0.0
 
 VOLUME /app/data
 EXPOSE 3000

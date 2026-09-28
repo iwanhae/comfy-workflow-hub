@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { stat, unlink } from "node:fs/promises";
 import type { HubConfig } from "./config.ts";
-import { isAllowedRequestHost } from "./config.ts";
 import { AssetService, assetResponse } from "./assets.ts";
 import { ComfyApiClient } from "./comfy-client.ts";
 import { ComfyDiscovery } from "./discovery.ts";
@@ -206,59 +205,6 @@ function decodeJobId(value: string): string {
 	return id;
 }
 
-function guardRequest(request: Request, allowLan: boolean, isMutation: boolean, requireSameOrigin = false): void {
-	const url = new URL(request.url);
-	if (!isAllowedRequestHost(url.hostname, allowLan)) {
-		throw new HttpError(403, "host_not_allowed", "Request Host must be loopback or an explicitly enabled private-LAN address");
-	}
-	const host = request.headers.get("host");
-	if (host !== null) {
-		try {
-			const hostUrl = new URL(`${url.protocol}//${host}`);
-			if (hostUrl.username || hostUrl.password || hostUrl.pathname !== "/" || hostUrl.search || hostUrl.hash || hostUrl.origin !== url.origin) {
-				throw new Error("host mismatch");
-			}
-		} catch {
-			throw new HttpError(403, "host_not_allowed", "Request Host must match the Hub request origin");
-		}
-	}
-	if (isMutation || requireSameOrigin) {
-		const origin = request.headers.get("origin");
-		if (origin !== null) {
-			try {
-				if (new URL(origin).origin !== url.origin) throw new Error("cross-origin");
-			} catch {
-				throw new HttpError(403, "origin_not_allowed", "Cross-origin state-changing requests are not allowed");
-			}
-		}
-	}
-}
-
-function guardMcpRequest(request: Request, allowLan: boolean): void {
-	const url = new URL(request.url);
-	const host = request.headers.get("host");
-	if (!host?.trim()) throw new HttpError(403, "host_not_allowed", "MCP Host header is required");
-	try {
-		const hostUrl = new URL(`${url.protocol}//${host}`);
-		if (hostUrl.username || hostUrl.password || hostUrl.pathname !== "/" || hostUrl.search || hostUrl.hash || hostUrl.origin !== url.origin) {
-			throw new Error("host mismatch");
-		}
-	} catch {
-		throw new HttpError(403, "host_not_allowed", "MCP Host header must match the request origin");
-	}
-	if (!isAllowedRequestHost(url.hostname, allowLan)) {
-		throw new HttpError(403, "host_not_allowed", "MCP Host must be loopback or an explicitly enabled private-LAN address");
-	}
-	const origin = request.headers.get("origin");
-	if (origin !== null) {
-		try {
-			if (new URL(origin).origin !== url.origin) throw new Error("origin mismatch");
-		} catch {
-			throw new HttpError(403, "origin_not_allowed", "Cross-origin MCP requests are not allowed");
-		}
-	}
-}
-
 async function isMcpJobWaitRequest(request: Request): Promise<boolean> {
 	if (request.method !== "POST" || !request.body) return false;
 	const length = Number(request.headers.get("content-length"));
@@ -338,11 +284,7 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs, jobProg
 			try {
 				const url = new URL(request.url);
 				const path = url.pathname;
-				const mutation = request.method !== "GET" && request.method !== "HEAD";
-				guardRequest(request, config.hubAllowLan, mutation, request.method === "GET" && path === "/api/v1/events");
-
 				if (path === "/mcp") {
-					guardMcpRequest(request, config.hubAllowLan);
 					if (server && await isMcpJobWaitRequest(request)) server.timeout(request, 0);
 					return await mcp.fetch(request);
 				}

@@ -502,17 +502,18 @@ describe("HTTP boundaries and Comfy proxy", () => {
 		expect(store.workflowCount()).toBe(0);
 	});
 
-	test("blocks disallowed Host and cross-origin mutation requests", async () => {
-		const badHost = await app.fetch(new Request("http://example.com/health"));
-		expect(badHost.status).toBe(403);
-		const badOrigin = await app.fetch(
+	test("allows public Host and cross-origin mutation requests", async () => {
+		const publicHost = await app.fetch(new Request("http://example.com/health"));
+		expect(publicHost.status).toBe(200);
+		const crossOrigin = await app.fetch(
 			new Request("http://127.0.0.1:3000/api/v1/workflows", {
 				method: "POST",
 				headers: { origin: "https://attacker.invalid", "content-type": "application/json" },
 				body: "{}",
 			}),
 		);
-		expect(badOrigin.status).toBe(403);
+		expect(crossOrigin.status).toBe(400);
+		expect(await errorCode(crossOrigin)).toBe("invalid_upload_id");
 	});
 
 	test("proxies only the documented GET endpoints to the configured Comfy target", async () => {
@@ -552,11 +553,10 @@ describe("HTTP boundaries and Comfy proxy", () => {
 		expect(calls.every((call) => call.startsWith("GET "))).toBe(true);
 	});
 
-	test("does not allow arbitrary public upstream targets without explicit LAN opt-in", () => {
-		expect(() => loadConfig({ COMFY_BASE_URL: "https://example.com" }, root)).toThrow("COMFY_ALLOW_LAN=true");
-		expect(() => loadConfig({ HUB_HOST: "0.0.0.0" }, root)).toThrow("HUB_ALLOW_LAN=true");
-		expect(
-			loadConfig({ COMFY_BASE_URL: liveLikeComfyUrl, COMFY_ALLOW_LAN: "true" }, root).comfyBaseUrl.origin,
-		).toBe(liveLikeComfyUrl);
+	test("accepts configurable bind addresses and upstream hostnames", () => {
+		expect(loadConfig({ COMFY_BASE_URL: "https://comfy.example.com" }, root).comfyBaseUrl.origin).toBe("https://comfy.example.com");
+		expect(loadConfig({ HUB_HOST: "0.0.0.0" }, root).host).toBe("0.0.0.0");
+		expect(loadConfig({ COMFY_BASE_URL: liveLikeComfyUrl }, root).comfyBaseUrl.origin).toBe(liveLikeComfyUrl);
+		expect(() => loadConfig({ COMFY_BASE_URL: "file:///etc/passwd" }, root)).toThrow("http or https");
 	});
 });

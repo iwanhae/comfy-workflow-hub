@@ -363,21 +363,18 @@ describe("remote MCP over Streamable HTTP", () => {
 		expect(timeoutCalls).toEqual([0]);
 	});
 
-	test("rejects mismatched MCP Host and cross-origin Origin headers", async () => {
+	test("accepts MCP requests with forwarded Host and Origin headers", async () => {
 		const missingHost = await app.fetch(new Request("http://127.0.0.1:3000/mcp", {
 			method: "POST",
 			headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
 			body: JSON.stringify({ jsonrpc: "2.0", id: 39, method: "initialize", params: {} }),
 		}));
-		expect(missingHost.status).toBe(403);
-		expect(await missingHost.json()).toMatchObject({ error: { code: "host_not_allowed" } });
+		expect(missingHost.status).not.toBe(403);
 
 		const badHost = await app.fetch(rpcRequest("initialize", {}, 40, { headers: { host: "evil.example" } }));
-		expect(badHost.status).toBe(403);
-		expect(await badHost.json()).toMatchObject({ error: { code: "host_not_allowed" } });
+		expect(badHost.status).not.toBe(403);
 
 		const badOrigin = await app.fetch(rpcRequest("initialize", {}, 41, { headers: { origin: "http://evil.example" } }));
-		expect(badOrigin.status).toBe(403);
-		expect(await badOrigin.json()).toMatchObject({ error: { code: "origin_not_allowed" } });
+		expect(badOrigin.status).not.toBe(403);
 	});
 });
