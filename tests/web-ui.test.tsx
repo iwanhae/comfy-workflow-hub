@@ -120,6 +120,30 @@ function sharedReads(url: URL): Response | null {
 }
 
 describe("shared hub browser flows", () => {
+	test("opens job activity details in an overlay with its saved JSON, inputs and outputs", async () => {
+		const output = { ...imageAsset, asset_id: "77777777-7777-4777-8777-777777777777", origin: "output", job_id: pendingId, workflow_value: null, original_filename: "result.png" };
+		setFetch((url) => {
+			const common = url.pathname.startsWith("/api/v1/assets") ? null : sharedReads(url);
+			if (common) return common;
+			if (url.pathname === "/api/v1/jobs") return response({ jobs: [{ id: pendingId, status: "completed", workflow_id: workflowId, create_time: Date.now() }], pagination: { total: 1, has_more: false } });
+			if (url.pathname === `/api/v1/jobs/${pendingId}`) return response({ id: pendingId, status: "completed", workflow_id: workflowId, create_time: Date.now() });
+			if (url.pathname === "/api/v1/assets") return response({ assets: [imageAsset, output], pagination: { total: 2, offset: 0, has_more: false } });
+			throw new Error(`Unexpected test request: ${url.pathname}`);
+		});
+		render(<App />);
+		fireEvent.click(await screen.findByRole("button", { name: /Saved workflow run · completed/ }));
+		const dialog = await screen.findByRole("dialog", { name: /Saved workflow run/ });
+		expect(dialog.closest(".detail-backdrop")).toBeTruthy();
+		await screen.findByText("Shared portrait");
+		expect(screen.getByText("Referenced Hub inputs")).toBeTruthy();
+		expect(screen.getByText("result.png")).toBeTruthy();
+		expect(screen.getByRole("link", { name: /Original JSON/ }).getAttribute("href")).toBe(`/api/v1/workflows/${workflowId}/content`);
+		fireEvent.click(screen.getByText("View API JSON"));
+		expect(dialog.textContent).toContain("EmptyImage");
+		fireEvent.keyDown(window, { key: "Escape" });
+		expect(screen.queryByRole("dialog", { name: /Saved workflow run/ })).toBeNull();
+	});
+
 	test("uses SSE snapshot and progress deltas, and only offers cancellation for pending jobs", async () => {
 		const calls = setFetch((url, init) => {
 			const common = sharedReads(url);
@@ -237,6 +261,27 @@ describe("shared hub browser flows", () => {
 		const link = await screen.findByRole("link", { name: /Download original/ });
 		expect(link.getAttribute("href")).toBe(`https://hub.example/api/v1/assets/${imageAssetId}/content`);
 		expect(screen.getAllByRole("link", { name: /Download original/ })).toHaveLength(1);
+	});
+
+	test("enlarges an image in a dialog without downloading it", async () => {
+		const calls = setFetch((url) => {
+			if (url.pathname === "/api/v1/status") return response({ ok: true, workflow_count: 0, comfy_configured: true });
+			if (url.pathname === "/api/v1/comfy/status") return response({ devices: [] });
+			if (url.pathname === "/api/v1/comfy/queue") return response({ queue_running: [], queue_pending: [] });
+			if (url.pathname === "/api/v1/jobs") return response({ jobs: [], pagination: { total: 0, has_more: false } });
+			if (url.pathname === "/api/v1/assets") return response({ assets: [imageAsset], pagination: { total: 1, offset: 0, has_more: false } });
+			throw new Error(`Unexpected test request: ${url.pathname}`);
+		});
+		render(<App />);
+		fireEvent.click(screen.getByRole("button", { name: "Assets" }));
+		fireEvent.click(await screen.findByRole("button", { name: "Enlarge portrait.png" }));
+		const dialog = screen.getByRole("dialog", { name: "Preview portrait.png" });
+		expect(dialog.querySelector("img")?.getAttribute("src")).toContain(`/api/v1/assets/${imageAssetId}/content`);
+		expect(dialog.querySelector("img")?.hasAttribute("download")).toBe(false);
+		expect(dialog.querySelector("a[download]")).toBeTruthy();
+		expect(calls.some((call) => call.includes(`/api/v1/assets/${imageAssetId}/content`))).toBe(false);
+		fireEvent.keyDown(window, { key: "Escape" });
+		expect(screen.queryByRole("dialog", { name: "Preview portrait.png" })).toBeNull();
 	});
 
 	test("refreshes a selected job from live status and archive polling without reselecting", async () => {

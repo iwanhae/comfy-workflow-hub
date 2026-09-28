@@ -63,6 +63,7 @@ export default function App() {
 	const [jobDetail, setJobDetail] = useState<JobRecord | null>(null);
 	const [jobAssets, setJobAssets] = useState<AssetRecord[]>([]);
 	const [jobWorkflow, setJobWorkflow] = useState<WorkflowMetadata | null>(null);
+	const [jobWorkflowGraph, setJobWorkflowGraph] = useState<Record<string, unknown> | null>(null);
 	const [jobDetailLoading, setJobDetailLoading] = useState(false);
 	const [jobDetailError, setJobDetailError] = useState<string | null>(null);
 	const [jobOutputsRefreshing, setJobOutputsRefreshing] = useState(false);
@@ -302,6 +303,7 @@ export default function App() {
 			setJobDetail(null);
 			setJobAssets([]);
 			setJobWorkflow(null);
+			setJobWorkflowGraph(null);
 			setJobDetailError(null);
 			setJobDetailLoading(false);
 			setJobOutputsRefreshing(false);
@@ -318,6 +320,7 @@ export default function App() {
 		setJobDetail(null);
 		setJobAssets([]);
 		setJobWorkflow(null);
+		setJobWorkflowGraph(null);
 		setJobDetailLoading(true);
 		setJobDetailError(null);
 		setJobOutputsRefreshing(false);
@@ -365,12 +368,19 @@ export default function App() {
 							workflowRequestedFor = job.workflow_id;
 							try {
 								const workflow = await getWorkflow(job.workflow_id);
-								if (active && selectedJobIdRef.current === id) setJobWorkflow(workflow.metadata);
+								if (active && selectedJobIdRef.current === id) {
+									setJobWorkflow(workflow.metadata);
+									setJobWorkflowGraph(workflow.workflow);
+								}
 							} catch {
-								if (active && selectedJobIdRef.current === id) setJobWorkflow(null);
+								if (active && selectedJobIdRef.current === id) {
+									setJobWorkflow(null);
+									setJobWorkflowGraph(null);
+								}
 							}
 						} else if (typeof job.workflow_id !== "string") {
 							setJobWorkflow(null);
+							setJobWorkflowGraph(null);
 						}
 					} catch (error) {
 						if (active && selectedJobIdRef.current === id) setJobDetailError(messageOf(error));
@@ -539,6 +549,7 @@ export default function App() {
 					canCancelJob={selectedCanCancel}
 					jobAssets={selectedDetailAssets}
 					jobWorkflow={selectedDetailWorkflow}
+					jobWorkflowGraph={selectedDetailWorkflow ? jobWorkflowGraph : null}
 					jobOutputsRefreshing={jobOutputsRefreshing}
 					onRefreshOutputs={handleRefreshOutputs}
 					jobDetailLoading={jobDetailLoading}
@@ -598,6 +609,7 @@ function BoardPage(props: {
 	canCancelJob: boolean;
 	jobAssets: AssetRecord[];
 	jobWorkflow: WorkflowMetadata | null;
+	jobWorkflowGraph: Record<string, unknown> | null;
 	jobOutputsRefreshing: boolean;
 	onRefreshOutputs: () => void;
 	jobDetailLoading: boolean;
@@ -639,13 +651,13 @@ function BoardPage(props: {
 		<div className="job-pagination"><span>Showing {props.jobTotal === 0 ? 0 : props.jobPage * props.jobsPerPage + 1}–{Math.min((props.jobPage + 1) * props.jobsPerPage, props.jobTotal)} of {props.jobTotal.toLocaleString()}</span><div><button className="button button-secondary" disabled={props.jobPage === 0 || props.jobsLoading} onClick={() => props.onPageChange(props.jobPage - 1)}>Previous</button><span>Page {props.jobPage + 1} of {Math.max(1, Math.ceil(props.jobTotal / props.jobsPerPage))}</span><button className="button button-secondary" disabled={(props.jobPage + 1) * props.jobsPerPage >= props.jobTotal || props.jobsLoading} onClick={() => props.onPageChange(props.jobPage + 1)}>Next</button></div></div>
 		<div className="cancel-policy"><span className="policy-icon"><Icon name="shield" /></span><p><strong>Safe queue controls.</strong> You can remove a job only while it is pending. The Hub never interrupts a running job.</p></div>
 		{props.jobs.length === 0 && !props.jobsLoading && !props.jobsError && <div className="empty-workspace"><div className="empty-art"><Icon name="spark" /></div><h3>No jobs yet</h3><p>Upload a saved API-format workflow and submit it to see jobs here.</p><button className="button button-primary" onClick={() => props.onNavigate("workflows")}>Open workflows</button></div>}
-		{props.selectedJobId && <JobDetailPanel
+		{props.selectedJobId && <div className="detail-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) props.onCloseDetail(); }}><JobDetailPanel
 			job={props.jobDetail ?? props.jobs.find((job) => job.id === props.selectedJobId) ?? null}
 			canCancel={props.canCancelJob}
-			assets={props.jobAssets} workflow={props.jobWorkflow} loading={props.jobDetailLoading} error={props.jobDetailError}
+			assets={props.jobAssets} workflow={props.jobWorkflow} workflowGraph={props.jobWorkflowGraph} loading={props.jobDetailLoading} error={props.jobDetailError}
 			outputsRefreshing={props.jobOutputsRefreshing} onRefreshOutputs={props.onRefreshOutputs}
 			cancelBusy={props.jobCancelBusy} cancelMessage={props.cancelMessage} onCancel={props.onCancel} onClose={props.onCloseDetail}
-		/>}
+		/></div>}
 	</>;
 }
 
@@ -671,6 +683,7 @@ function JobDetailPanel(props: {
 	canCancel: boolean;
 	assets: AssetRecord[];
 	workflow: WorkflowMetadata | null;
+	workflowGraph: Record<string, unknown> | null;
 	loading: boolean;
 	error: string | null;
 	outputsRefreshing: boolean;
@@ -680,13 +693,18 @@ function JobDetailPanel(props: {
 	onCancel: () => void;
 	onClose: () => void;
 }) {
+	useEffect(() => {
+		const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") props.onClose(); };
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [props.onClose]);
 	const job = props.job;
 	const readyAssets = props.assets.filter((asset) => asset.origin === "output" && asset.status === "ready").length;
 	const pendingAssets = props.assets.filter((asset) => asset.origin === "output" && asset.status === "pending").length;
 	const rejectedAssets = props.assets.filter((asset) => asset.origin === "output" && asset.status === "rejected").length;
 	const archiveLabel = props.assets.length === 0 ? "No archived outputs found" : pendingAssets > 0 ? `${pendingAssets} output${pendingAssets === 1 ? "" : "s"} archiving` : rejectedAssets > 0 ? "Archive needs attention" : `${readyAssets} output${readyAssets === 1 ? "" : "s"} ready`;
-	return <section className="detail-panel" aria-labelledby="job-detail-title">
-		<div className="detail-header"><div><div className="eyebrow">JOB DETAILS</div><h2 id="job-detail-title">{job ? jobLabel(job) : "Loading job…"}</h2></div><button className="icon-button" onClick={props.onClose} aria-label="Close job details">×</button></div>
+	return <section className="detail-panel" role="dialog" aria-modal="true" aria-labelledby="job-detail-title">
+		<div className="detail-header"><div><div className="eyebrow">JOB DETAILS</div><h2 id="job-detail-title">{job ? jobLabel(job) : "Loading job…"}</h2></div><button className="icon-button" autoFocus onClick={props.onClose} aria-label="Close job details">×</button></div>
 		{props.loading && <div className="inline-loading" role="status"><span className="spinner" />Loading full job, outputs and workflow…</div>}
 		{props.error && <div className="inline-error" role="alert">{props.error}</div>}
 		{job && <>
@@ -697,6 +715,7 @@ function JobDetailPanel(props: {
 				<section className="detail-section"><div className="detail-section-title"><h3>Saved workflow</h3>{job.workflow_id && <span className="muted-tag">{shortId(job.workflow_id)}</span>}</div>
 					{props.workflow ? <div className="linked-workflow"><span className="workflow-file-icon"><Icon name="workflow" /></span><div><strong>{props.workflow.name || props.workflow.filename || "Untitled workflow"}</strong><span>{formatBytes(props.workflow.bytes)} · saved {formatDate(props.workflow.createdAt)}</span></div><a className="text-link" href={`/api/v1/workflows/${encodeURIComponent(props.workflow.id)}/content`} download={props.workflow.filename || `${props.workflow.id}.json`}>Original JSON <Icon name="download" /></a></div>
 						: job.workflow_id ? <p className="subtle-copy">Workflow metadata unavailable for this job.</p> : <p className="subtle-copy">No saved Hub workflow is associated; this job was submitted outside the Hub.</p>}
+					{props.workflowGraph && <details className="raw-details"><summary>View API JSON</summary><pre>{safeJson(props.workflowGraph)}</pre></details>}
 				</section>
 				{props.assets.some((asset) => asset.origin === "input") && <section className="detail-section"><div className="detail-section-title"><h3>Referenced Hub inputs</h3></div><div className="asset-grid detail-assets">{props.assets.filter((asset) => asset.origin === "input").map((asset) => <AssetCard key={asset.asset_id} asset={asset} onCopied={() => undefined} />)}</div></section>}
 				<section className="detail-section"><div className="detail-section-title"><h3>Outputs</h3><span className={`archive-state ${pendingAssets ? "archive-pending" : readyAssets ? "archive-ready" : ""}`}><span className={`status-dot status-${readyAssets ? "complete" : pendingAssets ? "running" : "neutral"}`} />{archiveLabel}</span>{isUuid(job.id) && <button type="button" className="button button-secondary output-refresh" aria-label="Refresh outputs" aria-busy={props.outputsRefreshing} disabled={props.outputsRefreshing} onClick={props.onRefreshOutputs}>{props.outputsRefreshing ? "Refreshing…" : "Refresh outputs"}</button>}</div>
@@ -848,6 +867,7 @@ function WorkflowUploadDialog({ onClose, onUploaded }: { onClose: () => void; on
 }
 
 function AssetsPage({ assets, loading, loadingMore, hasMore, error, onLoadMore, onUpload, onCopied }: { assets: AssetRecord[]; loading: boolean; loadingMore: boolean; hasMore: boolean; error: string | null; onLoadMore: () => void; onUpload: () => void; onCopied: () => void }) {
+	const [preview, setPreview] = useState<AssetRecord | null>(null);
 	const inputAssets = assets.filter((asset) => asset.origin === "input");
 	const outputAssets = assets.filter((asset) => asset.origin === "output");
 	return <>
@@ -855,9 +875,10 @@ function AssetsPage({ assets, loading, loadingMore, hasMore, error, onLoadMore, 
 		<div className="asset-tip"><span className="tip-icon"><Icon name="info" /></span><p><strong>Keep workflows untouched.</strong> Copy the shown workflow value into your local API-format JSON. This shared Hub never edits a saved workflow.</p></div>
 		{loading && <LoadingState label="Loading shared assets…" />}{error && <ErrorState message={error} />}
 		{!loading && !error && assets.length === 0 && <EmptyState icon="asset" title="No assets yet" text="Upload an image or mask to make it available to workflows. Completed job outputs appear here after archiving." action={<button className="button button-primary" onClick={onUpload}><Icon name="upload" />Upload an asset</button>} />}
-		{inputAssets.length > 0 && <AssetSection title="Input assets" count={inputAssets.length} text="Originals stored by this Hub and staged to ComfyUI." assets={inputAssets} onCopied={onCopied} />}
-		{outputAssets.length > 0 && <AssetSection title="Job outputs" count={outputAssets.length} text="Archived copies with the original download reference." assets={outputAssets} onCopied={onCopied} />}
+		{inputAssets.length > 0 && <AssetSection title="Input assets" count={inputAssets.length} text="Originals stored by this Hub and staged to ComfyUI." assets={inputAssets} onCopied={onCopied} onPreview={setPreview} />}
+		{outputAssets.length > 0 && <AssetSection title="Job outputs" count={outputAssets.length} text="Archived copies with the original download reference." assets={outputAssets} onCopied={onCopied} onPreview={setPreview} />}
 		{hasMore && <button className="button button-secondary load-more" onClick={onLoadMore} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more assets"}</button>}
+		{preview && <AssetLightbox asset={preview} onClose={() => setPreview(null)} />}
 	</>;
 }
 
@@ -894,11 +915,11 @@ function AssetUploadDialog({ assets, onClose, onUploaded }: { assets: AssetRecor
 	</div>;
 }
 
-function AssetSection({ title, count, text, assets, onCopied }: { title: string; count: number; text: string; assets: AssetRecord[]; onCopied: () => void }) {
-	return <section className="asset-section"><div className="section-toolbar"><div><h2>{title} <span className="count-inline">{count}</span></h2><p>{text}</p></div></div><div className="asset-grid">{assets.map((asset) => <AssetCard key={asset.asset_id} asset={asset} onCopied={onCopied} />)}</div></section>;
+function AssetSection({ title, count, text, assets, onCopied, onPreview }: { title: string; count: number; text: string; assets: AssetRecord[]; onCopied: () => void; onPreview: (asset: AssetRecord) => void }) {
+	return <section className="asset-section"><div className="section-toolbar"><div><h2>{title} <span className="count-inline">{count}</span></h2><p>{text}</p></div></div><div className="asset-grid">{assets.map((asset) => <AssetCard key={asset.asset_id} asset={asset} onCopied={onCopied} onPreview={onPreview} />)}</div></section>;
 }
 
-function AssetCard({ asset, onCopied }: { asset: AssetRecord; onCopied: () => void }) {
+function AssetCard({ asset, onCopied, onPreview }: { asset: AssetRecord; onCopied: () => void; onPreview?: (asset: AssetRecord) => void }) {
 	const url = safeAssetUrl(asset.download_url);
 	const contentType = asset.content_type?.toLowerCase() ?? "";
 	const previewableImage = contentType.startsWith("image/") && !contentType.includes("svg");
@@ -926,7 +947,7 @@ function AssetCard({ asset, onCopied }: { asset: AssetRecord; onCopied: () => vo
 	};
 	return <article className="asset-card">
 		<div className="asset-preview">
-			{ready && previewableImage && <img src={url!} alt={label} loading="lazy" />}
+			{ready && previewableImage && (onPreview ? <button type="button" className="asset-preview-button" aria-label={`Enlarge ${label}`} onClick={() => onPreview(asset)}><img src={url!} alt="" loading="lazy" /><span className="asset-preview-hint"><Icon name="eye" />View full size</span></button> : <img src={url!} alt={label} loading="lazy" />)}
 			{ready && contentType.startsWith("video/") && <video src={url!} controls preload="metadata" aria-label={`Preview ${label}`} />}
 			{ready && contentType.startsWith("audio/") && <div className="audio-preview"><span className="audio-disc"><Icon name="audio" /></span><audio src={url!} controls preload="metadata" aria-label={`Preview ${label}`} /></div>}
 			{(!ready || (!previewableImage && !contentType.startsWith("video/") && !contentType.startsWith("audio/"))) && <span className="asset-fallback"><Icon name={asset.kind === "audio" ? "audio" : asset.kind === "video" ? "video" : "file"} /><span>{ready ? asset.kind.toUpperCase() : asset.status === "pending" ? "Archiving…" : asset.status}</span></span>}
@@ -938,6 +959,24 @@ function AssetCard({ asset, onCopied }: { asset: AssetRecord; onCopied: () => vo
 			{ready && <a className="asset-download" href={url!} download={downloadName(asset)}><Icon name="download" />Download original <span>{formatBytes(asset.bytes)}</span></a>}
 		</div>
 	</article>;
+}
+
+function AssetLightbox({ asset, onClose }: { asset: AssetRecord; onClose: () => void }) {
+	const url = safeAssetUrl(asset.download_url);
+	const label = asset.original_filename || asset.filename || `${asset.kind} ${shortId(asset.asset_id)}`;
+	useEffect(() => {
+		const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [onClose]);
+	if (!url) return null;
+	return <div className="lightbox-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+		<section className="lightbox-panel" role="dialog" aria-modal="true" aria-label={`Preview ${label}`}>
+			<div className="lightbox-header"><div><strong title={label}>{label}</strong><span>{asset.origin === "input" ? "Input original" : "Job output"} · {formatBytes(asset.bytes)}</span></div><button type="button" className="icon-button" autoFocus onClick={onClose} aria-label="Close image preview">×</button></div>
+			<img src={url} alt={label} />
+			<div className="lightbox-actions"><span>Original image · full preview</span><a className="button button-primary" href={url} download={downloadName(asset)}><Icon name="download" />Download original</a></div>
+		</section>
+	</div>;
 }
 
 function CatalogPage(props: {
