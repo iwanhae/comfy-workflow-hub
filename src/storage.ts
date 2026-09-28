@@ -150,6 +150,8 @@ export interface JobSubmission {
 	upstreamError: unknown | null;
 }
 
+export interface KnowledgeEntry { id: string; title: string; body: string; createdAt: number; updatedAt: number }
+
 interface JobSubmissionRow {
 	prompt_id: string;
 	workflow_id: string;
@@ -235,7 +237,7 @@ export class HubStore {
 		this.db = new Database(join(options.dataDir, "hub.sqlite"), { create: true });
 		this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
 		const versionRow = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
-		if (versionRow.user_version > 4) throw new Error(`Hub database schema ${versionRow.user_version} is newer than this server`);
+		if (versionRow.user_version > 5) throw new Error(`Hub database schema ${versionRow.user_version} is newer than this server`);
 		const migrate = this.db.transaction(() => {
 			this.db.exec(`
 				CREATE TABLE IF NOT EXISTS staged_uploads (
@@ -319,7 +321,13 @@ export class HubStore {
 						WHERE origin = 'output';
 				`);
 			}
-			this.db.exec("PRAGMA user_version = 4");
+			if (versionRow.user_version < 5) this.db.exec(`
+				CREATE TABLE knowledge (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+				CREATE INDEX knowledge_updated ON knowledge(updated_at DESC, id DESC);
+				CREATE TABLE job_input_assets (job_id TEXT NOT NULL, asset_id TEXT NOT NULL REFERENCES assets(id), node_id TEXT NOT NULL, input_name TEXT NOT NULL, PRIMARY KEY(job_id, asset_id, node_id, input_name));
+				CREATE INDEX job_input_assets_job ON job_input_assets(job_id);
+			`);
+			this.db.exec("PRAGMA user_version = 5");
 		});
 		migrate.immediate();
 		const clientId = this.db.transaction(() => {
@@ -751,19 +759,62 @@ export class HubStore {
 
 	listAssets(options: { limit: number; offset: number; jobId?: string }): { assets: AssetMetadata[]; total: number } {
 		const rows = options.jobId
-			? this.db.prepare("SELECT * FROM assets WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
-				.all(options.jobId, options.limit, options.offset) as AssetRow[]
+			? this.db.prepare("SELECT DISTINCT a.* FROM assets a LEFT JOIN job_input_assets i ON i.asset_id = a.id WHERE a.job_id = ? OR i.job_id = ? ORDER BY a.created_at DESC, a.id DESC LIMIT ? OFFSET ?")
+				.all(options.jobId, options.jobId, options.limit, options.offset) as AssetRow[]
 			: this.db.prepare("SELECT * FROM assets ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
 				.all(options.limit, options.offset) as AssetRow[];
 		const count = options.jobId
-			? this.db.prepare("SELECT COUNT(*) AS count FROM assets WHERE job_id = ?").get(options.jobId) as { count: number }
+			? this.db.prepare("SELECT COUNT(DISTINCT a.id) AS count FROM assets a LEFT JOIN job_input_assets i ON i.asset_id = a.id WHERE a.job_id = ? OR i.job_id = ?").get(options.jobId, options.jobId) as { count: number }
 			: this.db.prepare("SELECT COUNT(*) AS count FROM assets").get() as { count: number };
 		return { assets: rows.map(assetFromRow), total: count.count };
 	}
 
 	listJobAssets(jobId: string): AssetMetadata[] {
-		const rows = this.db.prepare("SELECT * FROM assets WHERE job_id = ? ORDER BY node_id, id").all(jobId) as AssetRow[];
+		const rows = this.db.prepare("SELECT DISTINCT a.* FROM assets a LEFT JOIN job_input_assets i ON i.asset_id = a.id WHERE a.job_id = ? OR i.job_id = ? ORDER BY a.origin, a.node_id, a.id").all(jobId, jobId) as AssetRow[];
 		return rows.map(assetFromRow);
+	}
+
+	associateJobInputAssets(jobId: string, workflow: Record<string, unknown>): void {
+		const assets = this.db.prepare("SELECT * FROM assets WHERE origin = 'input' AND status = 'ready'").all() as AssetRow[];
+		const insert = this.db.prepare("INSERT OR IGNORE INTO job_input_assets(job_id, asset_id, node_id, input_name) VALUES (?, ?, ?, ?)");
+		const tx = this.db.transaction(() => {
+			for (const [nodeId, rawNode] of Object.entries(workflow)) {
+				if (!isRecord(rawNode) || !isRecord(rawNode.inputs)) continue;
+				const expectedKind = inputAssetKindForNode(rawNode.class_type);
+				if (!expectedKind) continue;
+				for (const [inputName, value] of Object.entries(rawNode.inputs)) {
+					if (inputName !== "image" || typeof value !== "string") continue;
+					const candidates = assets.filter((row) => row.kind === expectedKind && row.comfy_type === "input" && row.comfy_filename !== null
+						&& (row.comfy_subfolder ? `${row.comfy_subfolder}/${row.comfy_filename}` === value : row.comfy_filename === value));
+					// A bare filename is valid only when unambiguous in the expected loader/kind namespace.
+					const unnamespaced = candidates.length === 0 && !value.includes("/")
+						? assets.filter((row) => row.kind === expectedKind && row.comfy_type === "input" && row.comfy_filename === value)
+						: [];
+					const matches = candidates.length ? candidates : unnamespaced;
+					if (matches.length === 1) insert.run(jobId, matches[0]!.id, nodeId, inputName);
+				}
+			}
+		});
+		tx.immediate();
+	}
+
+	listKnowledge(): KnowledgeEntry[] {
+		return (this.db.prepare("SELECT * FROM knowledge ORDER BY updated_at DESC, id DESC").all() as Array<{id:string;title:string;body:string;created_at:number;updated_at:number}>).map((r) => ({ id:r.id,title:r.title,body:r.body,createdAt:r.created_at,updatedAt:r.updated_at }));
+	}
+	getKnowledge(id: string): KnowledgeEntry | null {
+		const row = this.db.prepare("SELECT * FROM knowledge WHERE id = ?").get(id) as {id:string;title:string;body:string;created_at:number;updated_at:number} | null;
+		return row ? { id:row.id,title:row.title,body:row.body,createdAt:row.created_at,updatedAt:row.updated_at } : null;
+	}
+	setKnowledge(input: { id?: string; title: string; body: string }): KnowledgeEntry {
+		const id = input.id ?? randomUUID(); const now = this.now();
+		if (input.id) {
+			const result = this.db.prepare("UPDATE knowledge SET title = ?, body = ?, updated_at = ? WHERE id = ?").run(input.title, input.body, now, id);
+			if (!result.changes) throw new HttpError(404, "knowledge_not_found", "Knowledge entry not found");
+		} else this.db.prepare("INSERT INTO knowledge(id,title,body,created_at,updated_at) VALUES(?,?,?,?,?)").run(id,input.title,input.body,now,now);
+		return this.getKnowledge(id)!;
+	}
+	deleteKnowledge(id: string): void {
+		if (!this.db.prepare("DELETE FROM knowledge WHERE id = ?").run(id).changes) throw new HttpError(404, "knowledge_not_found", "Knowledge entry not found");
 	}
 
 	listPendingOutputAssets(): AssetMetadata[] {
@@ -914,4 +965,14 @@ function assertStorageName(name: string): void {
 	if (!/^[a-z0-9_-]{1,80}(?:\.[a-z0-9]{1,12})?$/.test(name)) {
 		throw new Error("Invalid stored asset name");
 	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function inputAssetKindForNode(value: unknown): InputAssetKind | null {
+	if (value === "LoadImage") return "image";
+	if (value === "LoadImageMask") return "mask";
+	return null;
 }

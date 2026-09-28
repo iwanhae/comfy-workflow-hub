@@ -110,9 +110,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	return value as T;
 }
 
-export async function listJobs(): Promise<JobRecord[]> {
-	const data = await request<{ jobs: JobRecord[] }>("/api/v1/jobs?limit=100&offset=0");
-	return data.jobs;
+export async function listJobs(offset = 0): Promise<Page<JobRecord>> {
+	const data = await request<{ jobs: JobRecord[]; pagination: { total: number; offset: number; has_more: boolean } }>(`/api/v1/jobs?limit=100&offset=${offset}`);
+	return { items: data.jobs, total: data.pagination.total, hasMore: data.pagination.has_more };
 }
 
 export async function getJob(id: string): Promise<JobRecord> {
@@ -130,7 +130,14 @@ export async function getWorkflow(id: string): Promise<{ metadata: WorkflowMetad
 }
 
 export async function listAssets(jobId?: string): Promise<AssetRecord[]> {
-	return (await listAssetPage(0, jobId)).items;
+	const assets: AssetRecord[] = [];
+	let offset = 0;
+	while (true) {
+		const page = await listAssetPage(offset, jobId);
+		assets.push(...page.items);
+		if (!page.hasMore || page.items.length === 0) return assets;
+		offset += page.items.length;
+	}
 }
 
 export async function listAssetPage(offset = 0, jobId?: string): Promise<Page<AssetRecord>> {
@@ -213,9 +220,10 @@ export async function getModel(folder: string, name: string): Promise<Record<str
 	return request(`/api/v1/comfy/models/${encodeURIComponent(folder)}/${encodeURIComponent(name)}`);
 }
 
-export async function getQwenGuide(): Promise<Record<string, unknown>> {
-	return request("/api/v1/comfy/model-guide/qwen-image-2.1");
-}
+export interface KnowledgeEntry { id: string; title: string; body: string; createdAt: number; updatedAt: number }
+export async function listKnowledge(): Promise<KnowledgeEntry[]> { return (await request<{entries: KnowledgeEntry[]}>('/api/v1/knowledge')).entries; }
+export async function setKnowledge(entry: {id?: string; title: string; body: string}): Promise<KnowledgeEntry> { return request('/api/v1/knowledge', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry)}); }
+export async function deleteKnowledge(id: string): Promise<void> { await request(`/api/v1/knowledge/${encodeURIComponent(id)}`, {method:'DELETE'}); }
 
 export function isUuid(value: string): boolean {
 	return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);

@@ -204,16 +204,16 @@ afterEach(async () => {
 });
 
 describe("remote MCP over Streamable HTTP", () => {
-	test("initializes, exposes exactly 17 tools, and uploads/lists/gets stored workflows", async () => {
+	test("initializes, exposes exactly 20 tools, and uploads/lists/gets stored workflows", async () => {
 		await initializeMcp();
 		const listResponse = await app.fetch(rpcRequest("tools/list", {}, 2));
 		const listPayload = await rpcPayload(listResponse);
 		const tools = (listPayload.result as { tools: Array<{ name: string; description?: string }> }).tools;
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
 			"asset_get", "asset_list", "asset_upload", "job_cancel", "job_get", "job_list", "job_submit", "job_wait",
-			"model_get", "model_guide", "model_list", "node_get", "node_list", "server_get", "workflow_get", "workflow_list", "workflow_upload",
+			"knowledge_delete", "knowledge_get", "knowledge_list", "knowledge_set", "model_get", "model_list", "node_get", "node_list", "server_get", "workflow_get", "workflow_list", "workflow_upload",
 		].sort());
-		expect(tools).toHaveLength(17);
+		expect(tools).toHaveLength(20);
 		expect(tools.find((tool) => tool.name === "workflow_upload")?.description).toContain("MCP cannot read a client-local file path");
 
 		const uploadId = await stage(apiWorkflow, "workflow-api.json");
@@ -229,10 +229,16 @@ describe("remote MCP over Streamable HTTP", () => {
 		const detail = toolValue(await callTool("workflow_get", { workflow_id: workflowId }, 5));
 		expect(detail.metadata).toMatchObject({ id: workflowId, filename: "workflow-api.json" });
 		expect(detail.workflow).toEqual({ "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "example.safetensors" } } });
+		const card = toolValue(await callTool("knowledge_set", { title: "Tip", body: "Save the prompt" }, 6));
+		const edited = toolValue(await callTool("knowledge_set", { id: card.id, title: "Tip updated", body: "Save the prompt carefully" }, 7));
+		expect(edited).toMatchObject({ id: card.id, title: "Tip updated", body: "Save the prompt carefully" });
+		expect(toolValue(await callTool("knowledge_get", { id: card.id }, 8))).toMatchObject({ title: "Tip updated" });
+		expect((toolValue(await callTool("knowledge_list", {}, 9)).result as unknown[])).toHaveLength(1);
+		expect(toolValue(await callTool("knowledge_delete", { id: card.id }, 10))).toEqual({ deleted: true });
 		expect(upstreamCalls.some((call) => call.method === "POST" && new URL(call.url).pathname === "/prompt")).toBe(false);
 	});
 
-	test("serves compact node/model discovery, full details, verified guides, and safe server status", async () => {
+	test("serves compact node/model discovery, full details, and safe server status", async () => {
 		await initializeMcp();
 		const nodeList = toolValue(await callTool("node_list", { query: "sampler", limit: 1, offset: 0 }, 10));
 		expect(nodeList.nodes).toEqual([expect.objectContaining({ node_id: "KSampler", category: "sampling" })]);
@@ -258,45 +264,12 @@ describe("remote MCP over Streamable HTTP", () => {
 		expect(model.installed).toBe(true);
 		expect(model.loaders).toEqual([expect.objectContaining({ node_id: "UNETLoader", input_name: "unet_name" })]);
 
-		const guide = toolValue(await callTool("model_guide", { model: "Qwen Image 2.1" }, 14));
-		expect(guide).toMatchObject({ status: "available", installation_status: "all_files_installed", source: { path: "workflows/t2i.json" } });
-		expect((guide.parameters as { sampler: { steps: number; cfg: number } }).sampler).toEqual(expect.objectContaining({ steps: 25, cfg: 1 }));
-		expect((guide.model_files as Array<{ installed: boolean }>).every((file) => file.installed)).toBe(true);
-
-		const unknownGuide = toolValue(await callTool("model_guide", { model: "unlisted future model" }, 15));
-		expect(unknownGuide).toMatchObject({ status: "not_available", model: "unlisted future model" });
-		expect(String(unknownGuide.message)).toContain("No recommendations were inferred");
-		const restGuide = await app.fetch(new Request("http://127.0.0.1:3000/api/v1/comfy/model-guide/qwen-image-2.1"));
-		expect(await restGuide.json()).toMatchObject({ status: "available", guide_version: "1.0.0" });
-
-		const server = toolValue(await callTool("server_get", {}, 16));
+		const server = toolValue(await callTool("server_get", {}, 14));
 		expect(server).toMatchObject({ version: { comfyui: "0.37.0" }, devices: [{ name: "Mock GPU", type: "cuda" }], queue: { running: 1, pending: 2 } });
 		expect(JSON.stringify(server)).not.toContain("must-not-leak");
 
 		expect(upstreamCalls.filter((call) => new URL(call.url).pathname === "/object_info")).toHaveLength(1);
 		expect(upstreamCalls.filter((call) => /^\/models\//.test(new URL(call.url).pathname))).toHaveLength(3);
-	});
-
-	test("does not mark a guide file installed when only a same-named file exists in the wrong folder", async () => {
-		await initializeMcp();
-		modelFolderOverride = {
-			diffusion_models: [],
-			text_encoders: [...modelFiles.text_encoders, "qwen_image_2.1_int8_convrot.safetensors"],
-			vae: [...modelFiles.vae],
-		};
-		const guide = toolValue(await callTool("model_guide", { model: "Qwen Image 2.1" }, 17));
-		const files = guide.model_files as Array<Record<string, unknown>>;
-		const diffusion = files.find((file) => file.filename === "qwen_image_2.1_int8_convrot.safetensors");
-		expect(diffusion).toMatchObject({
-			expected_folder: "diffusion_models",
-			loader_schema_available: true,
-			loader_choice_match: true,
-			folder_match: false,
-			installed: false,
-			installed_folder: null,
-			found_in_other_folders: ["text_encoders"],
-		});
-		expect(guide.installation_status).toBe("some_files_not_verified_installed");
 	});
 
 	test("shares REST asset behavior and returns stable same-origin content URLs", async () => {

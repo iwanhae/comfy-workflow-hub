@@ -78,6 +78,28 @@ afterEach(async () => {
 });
 
 describe("durable ComfyUI job execution", () => {
+	test("records only unambiguous input assets matching a supported loader and asset kind", () => {
+		const imageId = randomUUID();
+		const maskId = randomUUID();
+		const otherId = randomUUID();
+		const addInput = (id: string, kind: "image" | "mask", subfolder: string) => store.db.prepare(`
+			INSERT INTO assets(id,kind,origin,status,upload_id,comfy_filename,comfy_subfolder,comfy_type,created_at,updated_at)
+			VALUES (?,?,'input','ready',?,?,?,'input',1,1)
+		`).run(id, kind, randomUUID(), "same.png", subfolder);
+		addInput(imageId, "image", "comfy-hub/image");
+		addInput(maskId, "mask", "comfy-hub/mask");
+		addInput(otherId, "image", "other/source");
+		store.associateJobInputAssets(randomUUID(), {});
+		const jobId = randomUUID();
+		store.associateJobInputAssets(jobId, {
+			"1": { class_type: "LoadImage", inputs: { image: "comfy-hub/image/same.png" } },
+			"2": { class_type: "LoadImageMask", inputs: { image: "comfy-hub/mask/same.png" } },
+			"3": { class_type: "LoadImage", inputs: { image: "same.png" } },
+			"4": { class_type: "SomeCustomNode", inputs: { image: "other/source/same.png" } },
+		});
+		expect(store.listJobAssets(jobId).map((asset) => asset.id).sort()).toEqual([imageId, maskId].sort());
+	});
+
 	test("submits the stored graph unchanged with a durable client id and idempotent request key", async () => {
 		const workflowId = await createWorkflow();
 		const posts: Array<Record<string, unknown>> = [];

@@ -138,6 +138,15 @@ function parseJobSubmission(value: unknown): { workflowId: string; metadata: Rec
 	return { workflowId: body.workflow_id, metadata, clientRequestId };
 }
 
+function parseKnowledge(value: unknown): { id?: string; title: string; body: string } {
+	if (!isRecord(value)) throw new HttpError(400, "invalid_request", "Request body must be an object");
+	for (const key of Object.keys(value)) if (!["id", "title", "body"].includes(key)) throw new HttpError(400, "invalid_request", `Unknown field: ${key}`);
+	if (value.id !== undefined && (typeof value.id !== "string" || !/^[0-9a-f-]{36}$/.test(value.id))) throw new HttpError(400, "invalid_knowledge_id", "id must be a UUID");
+	if (typeof value.title !== "string" || !value.title.trim() || value.title.length > 200) throw new HttpError(400, "invalid_knowledge_title", "title must be non-empty text up to 200 characters");
+	if (typeof value.body !== "string" || value.body.length > 10_000) throw new HttpError(400, "invalid_knowledge_body", "body must be text up to 10000 characters");
+	return { ...(typeof value.id === "string" ? { id: value.id } : {}), title: value.title.trim(), body: value.body };
+}
+
 function parseOptionalText(value: unknown, field: string, maxLength: number): string | null | undefined {
 	if (value === undefined) return undefined;
 	if (value === null) return null;
@@ -298,6 +307,22 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs, jobProg
 					});
 				}
 
+				if (path === "/api/v1/knowledge" && request.method === "GET") return jsonResponse({ entries: store.listKnowledge() });
+				if (path === "/api/v1/knowledge" && request.method === "POST") {
+					const input = parseKnowledge(await readJsonBody(request));
+					return jsonResponse(store.setKnowledge(input), input.id ? 200 : 201);
+				}
+				const knowledgeMatch = /^\/api\/v1\/knowledge\/([^/]+)$/.exec(path);
+				if (knowledgeMatch && request.method === "GET") {
+					const entry = store.getKnowledge(decodePathSegment(knowledgeMatch[1]!));
+					if (!entry) throw new HttpError(404, "knowledge_not_found", "Knowledge entry not found");
+					return jsonResponse(entry);
+				}
+				if (knowledgeMatch && request.method === "DELETE") {
+					store.deleteKnowledge(decodePathSegment(knowledgeMatch[1]!));
+					return jsonResponse({ deleted: true });
+				}
+
 				if (request.method === "GET" && path === "/api/v1/events") {
 					server?.timeout(request, 0);
 					jobProgress.assertSubscriberCapacity();
@@ -455,10 +480,6 @@ export function createHubApp({ config, store, comfy, jobs: suppliedJobs, jobProg
 						decodePathSegment(modelDetailMatch[1]!),
 						decodePathSegment(modelDetailMatch[2]!),
 					));
-				}
-				const modelGuideMatch = /^\/api\/v1\/comfy\/model-guide\/([^/]+)$/.exec(path);
-				if (request.method === "GET" && modelGuideMatch) {
-					return jsonResponse(await discovery.modelGuide(decodePathSegment(modelGuideMatch[1]!)));
 				}
 				if (request.method === "GET" && path === "/api/v1/comfy/models") return jsonResponse(await comfy.getModels());
 				const modelMatch = /^\/api\/v1\/comfy\/models\/([^/]+)$/.exec(path);

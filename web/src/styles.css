@@ -481,3 +481,27 @@ a { color: inherit; }
 @media (prefers-reduced-motion: reduce) {
 	*, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+.activity-table-wrap { overflow: auto; border: 1px solid var(--line, #e7e5e4); border-radius: 16px; background: white; }
+.activity-table { width: 100%; border-collapse: collapse; text-align: left; }
+.activity-table th, .activity-table td { padding: 14px 18px; border-bottom: 1px solid var(--line, #e7e5e4); }
+.activity-table th { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #777; }
+.activity-table tbody tr { cursor: pointer; }
+.activity-table tbody tr:hover, .activity-table .activity-selected { background: #f7f5ff; }
+.activity-table td:first-child strong, .activity-table td:first-child small { display: block; }
+.activity-table td:first-child small { color: #888; margin-top: 4px; }
+.job-pagination { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 16px 0; }
+.job-pagination > div { display: flex; align-items: center; gap: 10px; }
+.knowledge-layout { display: grid; grid-template-columns: minmax(250px, 350px) 1fr; gap: 24px; }
+.knowledge-editor, .knowledge-card { padding: 22px; border: 1px solid var(--line, #e7e5e4); border-radius: 16px; background: white; }
+.knowledge-editor { display: flex; flex-direction: column; gap: 12px; align-self: start; }
+.knowledge-editor input, .knowledge-editor textarea { width: 100%; padding: 10px; border: 1px solid #dedbe5; border-radius: 8px; font: inherit; }
+.knowledge-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
+.knowledge-card h3 { margin: 0 0 10px; }
+.knowledge-card p { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 56px; }
+.knowledge-card small { color: #777; }
+.knowledge-card > div { display: flex; gap: 8px; margin-top: 14px; }
+@media (max-width: 700px) {
+	.knowledge-layout { grid-template-columns: 1fr; }
+	.activity-table th, .activity-table td { padding: 10px; }
+	.job-pagination { flex-wrap: wrap; }
+}

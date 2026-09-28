@@ -70,9 +70,16 @@ function createRequestServer(context: McpRequestContext, options: HubMcpOptions)
 		name: z.string().min(1).max(1024),
 	}), (args) => discovery.getModel(args.folder, args.name));
 
-	registerJsonTool(server, "model_guide", "Return a versioned curated guide only when one is present. Known guides show repository source facts and verify each file against its expected model folder and live loader choice; unknown models return status=not_available with no inferred recommendation.", z.object({
-		model: z.string().min(1).max(200),
-	}), (args) => discovery.modelGuide(args.model));
+	registerJsonTool(server, "knowledge_list", "List saved knowledge board cards.", z.object({}), () => store.listKnowledge());
+	registerJsonTool(server, "knowledge_get", "Get one saved knowledge card by id.", z.object({ id: UUID }), (args) => {
+		const entry = store.getKnowledge(args.id);
+		if (!entry) throw new HttpError(404, "knowledge_not_found", "Knowledge entry not found");
+		return entry;
+	});
+	registerJsonTool(server, "knowledge_set", "Create a knowledge card when id is omitted, or update the existing card when id is supplied.", z.object({
+		id: UUID.optional(), title: z.string().trim().min(1).max(200), body: z.string().max(10_000),
+	}), (args) => store.setKnowledge(args));
+	registerJsonTool(server, "knowledge_delete", "Delete one saved knowledge card by id.", z.object({ id: UUID }), (args) => { store.deleteKnowledge(args.id); return { deleted: true }; });
 
 	registerJsonTool(server, "workflow_upload", "Commit a staged ComfyUI API-format workflow. First upload the bytes out-of-band to POST /api/v1/uploads (multipart field `file`) and pass its returned upload_id here. MCP cannot read a client-local file path; this tool never accepts raw workflow JSON.", z.object({
 		upload_id: UUID,

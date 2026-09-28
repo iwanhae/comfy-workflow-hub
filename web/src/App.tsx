@@ -7,16 +7,18 @@ import {
 	getJob,
 	getModel,
 	getNode,
-	getQwenGuide,
 	getWorkflow,
 	isUuid,
 	listAssets,
 	listAssetPage,
 	listJobs,
+	listKnowledge,
 	listWorkflows,
 	newRequestId,
 	searchModels,
 	searchNodes,
+	setKnowledge,
+	deleteKnowledge,
 	stageAndCommitWorkflow,
 	stageAndPromoteAsset,
 	submitJob,
@@ -25,9 +27,10 @@ import {
 	type LiveJob,
 	type ProgressState,
 	type WorkflowMetadata,
+	type KnowledgeEntry,
 } from "./api.ts";
 
-type PageName = "board" | "workflows" | "assets" | "catalog";
+type PageName = "board" | "workflows" | "assets" | "catalog" | "knowledge";
 type BoardColumn = "queue" | "running" | "completed" | "failed";
 
 interface EventSnapshot {
@@ -46,6 +49,8 @@ const MAX_PENDING_OUTPUT_CHECKS = 16;
 export default function App() {
 	const [page, setPage] = useState<PageName>("board");
 	const [jobs, setJobs] = useState<JobRecord[]>([]);
+	const [jobTotal, setJobTotal] = useState(0);
+	const [jobPage, setJobPage] = useState(0);
 	const [jobsLoading, setJobsLoading] = useState(true);
 	const [jobsError, setJobsError] = useState<string | null>(null);
 	const [liveJobs, setLiveJobs] = useState<Record<string, LiveJob>>({});
@@ -85,23 +90,26 @@ export default function App() {
 	const [catalogError, setCatalogError] = useState<string | null>(null);
 	const [catalogDetailTitle, setCatalogDetailTitle] = useState<string | null>(null);
 	const [catalogDetail, setCatalogDetail] = useState<Record<string, unknown> | null>(null);
-	const [qwenGuide, setQwenGuide] = useState<Record<string, unknown> | null>(null);
-	const [guideBusy, setGuideBusy] = useState(false);
+	const [knowledge, setKnowledgeState] = useState<KnowledgeEntry[]>([]);
 	const [globalError, setGlobalError] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [showWorkflowUpload, setShowWorkflowUpload] = useState(false);
 	const [showAssetUpload, setShowAssetUpload] = useState(false);
 	const lastSequence = useRef(0);
 	const selectedJobIdRef = useRef<string | null>(null);
+	const jobPageRef = useRef(jobPage);
+	jobPageRef.current = jobPage;
 	const selectedDetailRefreshRef = useRef<((id: string, force?: boolean) => void) | null>(null);
 	const assetPageRequestRef = useRef<Promise<Awaited<ReturnType<typeof listAssetPage>>> | null>(null);
 	selectedJobIdRef.current = selectedJobId;
 
-	const refreshJobs = useCallback(async () => {
+	const refreshJobs = useCallback(async (requestedPage = jobPageRef.current) => {
 		setJobsLoading(true);
 		try {
-			const nextJobs = await listJobs();
-			setJobs(nextJobs);
+			const data = await listJobs(requestedPage * 100);
+			if (requestedPage !== jobPageRef.current) return;
+			setJobs(data.items);
+			setJobTotal(data.total);
 			setJobsError(null);
 		} catch (error) {
 			setJobsError(messageOf(error));
@@ -159,7 +167,7 @@ export default function App() {
 			window.clearInterval(poll);
 			window.clearInterval(overviewPoll);
 		};
-	}, [feedConnected, refreshJobs, refreshOverview]);
+	}, [feedConnected, jobPage, refreshJobs, refreshOverview]);
 
 	useEffect(() => {
 		if (typeof window.EventSource === "undefined") return;
@@ -177,7 +185,7 @@ export default function App() {
 			const snapshot = parseEvent<EventSnapshot>(event);
 			if (!snapshot || !Array.isArray(snapshot.jobs)) return;
 			lastSequence.current = snapshot.sequence;
-			setLiveJobs(Object.fromEntries(snapshot.jobs.map((job) => [job.job_id, job])));
+			setLiveJobs((previous) => Object.fromEntries(snapshot.jobs.map((job) => [job.job_id, { ...previous[job.job_id], ...job }])));
 			if (snapshot.state) setFeedState(snapshot.state);
 			setFeedConnected(true);
 		});
@@ -185,7 +193,7 @@ export default function App() {
 			const value = parseEvent<{ sequence: number; job: LiveJob }>(event);
 			if (!value?.job || value.sequence <= lastSequence.current) return;
 			lastSequence.current = value.sequence;
-			setLiveJobs((previous) => ({ ...previous, [value.job.job_id]: value.job }));
+			setLiveJobs((previous) => ({ ...previous, [value.job.job_id]: { ...previous[value.job.job_id], ...value.job } }));
 		});
 		source.addEventListener("state", (event) => {
 			const value = parseEvent<{ sequence: number; state: ProgressState }>(event);
@@ -258,17 +266,10 @@ export default function App() {
 	}, [page, catalogTab, nodeQuery, modelQuery]);
 
 	const shownJobs = useMemo(() => {
-		const byId = new Map(jobs.map((job) => [job.id, job]));
-		for (const live of Object.values(liveJobs)) {
-			const previous = byId.get(live.job_id);
-			byId.set(live.job_id, {
-				...(previous ?? {}),
-				...live,
-				id: live.job_id,
-				workflow_id: live.workflow_id ?? previous?.workflow_id,
-			} as JobRecord);
-		}
-		return [...byId.values()].sort((left, right) => numberField(right.create_time) - numberField(left.create_time));
+		return jobs.map((job) => {
+			const live = liveJobs[job.id];
+			return live ? { ...job, ...live, id: job.id, create_time: job.create_time, workflow_id: live.workflow_id ?? job.workflow_id } as JobRecord : job;
+		});
 	}, [jobs, liveJobs]);
 
 	const selectedListJob = shownJobs.find((job) => job.id === selectedJobId) ?? null;
@@ -485,7 +486,7 @@ export default function App() {
 		if (selectedJobId) selectedDetailRefreshRef.current?.(selectedJobId, true);
 	};
 
-	const title = ({ board: "Job board", workflows: "Workflows", assets: "Assets", catalog: "Node & model catalog" } as const)[page];
+	const title = ({ board: "Job board", workflows: "Workflows", assets: "Assets", catalog: "Node & model catalog", knowledge: "Knowledge" } as const)[page];
 	const serverLabel = feedConnected ? "Live updates on" : typeof window.EventSource === "undefined" ? "REST refresh" : "Reconnecting";
 
 	return <div className="app-shell">
@@ -499,6 +500,7 @@ export default function App() {
 				<NavButton active={page === "workflows"} onClick={() => setPage("workflows")} icon="workflow" label="Workflows" />
 				<NavButton active={page === "assets"} onClick={() => setPage("assets")} icon="asset" label="Assets" />
 				<NavButton active={page === "catalog"} onClick={() => setPage("catalog")} icon="search" label="Node & model catalog" />
+				<NavButton active={page === "knowledge"} onClick={() => setPage("knowledge")} icon="workflow" label="Knowledge board" />
 			</nav>
 			<div className="sidebar-bottom">
 				<div className="live-card"><span className={`live-dot ${feedConnected ? "is-live" : ""}`} />
@@ -520,6 +522,10 @@ export default function App() {
 				{notice && <div className="message-banner success-banner" role="status"><Icon name="check" /><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice(null)}>×</button></div>}
 				{page === "board" && <BoardPage
 					jobs={shownJobs}
+					jobTotal={jobTotal}
+					jobPage={jobPage}
+					jobsPerPage={100}
+					onPageChange={setJobPage}
 					jobsLoading={jobsLoading}
 					jobsError={jobsError}
 					counts={counts}
@@ -552,8 +558,8 @@ export default function App() {
 							try { window.sessionStorage.setItem(`comfy-hub:request-id:${workflowId}`, value); } catch { /* storage can be disabled by browser policy */ }
 						}}
 					hasMore={workflowHasMore} loadingMore={workflowLoadingMore} onLoadMore={loadMoreWorkflows}
-					onSubmitted={(id) => { void refreshJobs(); setSelectedJobId(id); setPage("board"); setNotice("Job submitted. Its workflow remains unchanged."); }}
-					onViewAttempt={(id) => { void refreshJobs(); setSelectedJobId(id); setPage("board"); setNotice("Showing the recorded submission attempt. Retry only with the same request ID."); }}
+					onSubmitted={(id) => { setJobPage(0); void refreshJobs(0); setSelectedJobId(id); setPage("board"); setNotice("Job submitted. Its workflow remains unchanged."); }}
+					onViewAttempt={(id) => { setJobPage(0); void refreshJobs(0); setSelectedJobId(id); setPage("board"); setNotice("Showing the recorded submission attempt. Retry only with the same request ID."); }}
 				/>}
 				{page === "assets" && <AssetsPage assets={assetList} loading={assetsLoading} loadingMore={assetLoadingMore} hasMore={assetHasMore} error={assetError} onLoadMore={loadMoreAssets} onUpload={() => setShowAssetUpload(true)} onCopied={() => setNotice("Workflow value copied. Paste it into your local API-format workflow JSON.")} />}
 				{page === "catalog" && <CatalogPage
@@ -562,8 +568,8 @@ export default function App() {
 					busy={catalogBusy} error={catalogError} detailTitle={catalogDetailTitle} detail={catalogDetail}
 					onNode={async (nodeId) => { setCatalogDetailTitle(nodeId); setCatalogDetail(null); try { setCatalogDetail(await getNode(nodeId)); } catch (error) { setCatalogError(messageOf(error)); } }}
 					onModel={async (folder, name) => { setCatalogDetailTitle(`${folder}/${name}`); setCatalogDetail(null); try { setCatalogDetail(await getModel(folder, name)); } catch (error) { setCatalogError(messageOf(error)); } }}
-					qwenGuide={qwenGuide} guideBusy={guideBusy} onGuide={async () => { setGuideBusy(true); try { setQwenGuide(await getQwenGuide()); } catch (error) { setCatalogError(messageOf(error)); } finally { setGuideBusy(false); } }}
 				/>}
+				{page === "knowledge" && <KnowledgePage entries={knowledge} onLoad={async () => setKnowledgeState(await listKnowledge())} onSave={async (entry) => { await setKnowledge(entry); setKnowledgeState(await listKnowledge()); }} onDelete={async (id) => { await deleteKnowledge(id); setKnowledgeState(await listKnowledge()); }} />}
 			</main>
 			<footer className="footer-line"><span>COMFYUI WORKFLOW HUB</span><span>{hubStatus ? `${hubStatus.workflow_count} saved ${hubStatus.workflow_count === 1 ? "workflow" : "workflows"}` : "Shared workspace"}</span></footer>
 		</div>
@@ -575,6 +581,10 @@ export default function App() {
 
 function BoardPage(props: {
 	jobs: JobRecord[];
+	jobTotal: number;
+	jobPage: number;
+	jobsPerPage: number;
+	onPageChange: (page: number) => void;
 	jobsLoading: boolean;
 	jobsError: string | null;
 	counts: Record<BoardColumn, number>;
@@ -598,12 +608,6 @@ function BoardPage(props: {
 	onCloseDetail: () => void;
 	onNavigate: (page: PageName) => void;
 }) {
-	const columns: Array<{ id: BoardColumn; label: string; description: string }> = [
-		{ id: "queue", label: "Queue", description: "Waiting to run" },
-		{ id: "running", label: "Running", description: "Live execution" },
-		{ id: "completed", label: "Completed", description: "Ready to review" },
-		{ id: "failed", label: "Failed", description: "Needs attention" },
-	];
 	const [filter, setFilter] = useState<"all" | BoardColumn>("all");
 	const queueRunning = arrayLength(props.queueOverview?.queue_running);
 	const queuePending = arrayLength(props.queueOverview?.queue_pending);
@@ -618,29 +622,21 @@ function BoardPage(props: {
 		</div>
 		<div className="overview-grid" aria-label="Server and queue overview">
 			<OverviewCard label="In queue" value={props.feedState.queue_remaining ?? (queueRunning + queuePending)} meta={`${queuePending} pending · ${queueRunning} running`} icon="queue" tone="peach" />
-			<OverviewCard label="Active jobs" value={props.counts.queue + props.counts.running} meta={`${props.counts.queue} pending · ${props.counts.running} running`} icon="pulse" tone="lavender" />
+			<OverviewCard label="Active jobs on this page" value={props.counts.queue + props.counts.running} meta={`${props.counts.queue} pending · ${props.counts.running} running`} icon="pulse" tone="lavender" />
 			<OverviewCard label="Saved workflows" value={props.hubStatus?.workflow_count ?? "—"} meta="Immutable versions" icon="workflow" tone="mint" />
 			<OverviewCard label="ComfyUI server" value={machine.label} meta={machine.detail} icon="server" tone="blue" />
 		</div>
 
 		<div className="section-toolbar">
-			<div><h2>Job activity</h2><p>Live status · all connected clients</p></div>
+			<div><h2>Job activity</h2><p>Live status · {props.jobTotal.toLocaleString()} total jobs</p></div>
 			<div className="filter-tabs" role="group" aria-label="Filter jobs">
-				{(["all", "queue", "running", "completed", "failed"] as const).map((value) => <button key={value} className={filter === value ? "filter-active" : ""} aria-pressed={filter === value} onClick={() => setFilter(value)}>{value === "all" ? "All jobs" : titleCase(value)}{value === "all" ? <span>{props.jobs.length}</span> : <span>{props.counts[value]}</span>}</button>)}
+				{(["all", "queue", "running", "completed", "failed"] as const).map((value) => <button key={value} className={filter === value ? "filter-active" : ""} aria-pressed={filter === value} onClick={() => setFilter(value)}>{value === "all" ? "All jobs" : titleCase(value)}</button>)}
 			</div>
 		</div>
 		{props.jobsLoading && props.jobs.length === 0 ? <LoadingState label="Loading shared jobs…" />
 			: props.jobsError && props.jobs.length === 0 ? <ErrorState message={props.jobsError} />
-			: <div className={`board-grid ${filter !== "all" ? "board-filtered" : ""}`}>
-			{columns.filter((column) => filter === "all" || filter === column.id).map((column) => {
-				const items = props.jobs.filter((job) => columnForStatus(job.status) === column.id);
-				return <section className={`board-column column-${column.id}`} key={column.id} aria-labelledby={`heading-${column.id}`}>
-					<div className="column-heading"><span className={`column-marker marker-${column.id}`} /><div><h3 id={`heading-${column.id}`}>{column.label}</h3><p>{column.description}</p></div><span className="column-count">{items.length}</span></div>
-					<div className="job-list">{items.map((job) => <JobCard key={job.id} job={job} selected={props.selectedJobId === job.id} onClick={() => props.onSelect(job.id)} />)}</div>
-					{items.length === 0 && <div className="column-empty"><span className="empty-glyph">{column.id === "failed" ? "✓" : "· · ·"}</span><span>{column.id === "failed" ? "Nothing needs attention" : `No ${column.label.toLowerCase()} jobs`}</span></div>}
-				</section>;
-			})}
-			</div>}
+			: <div className="activity-table-wrap"><table className="activity-table"><thead><tr><th>Job</th><th>Status</th><th>Progress</th><th>Workflow</th><th>Submitted</th></tr></thead><tbody>{props.jobs.filter((job) => filter === "all" || columnForStatus(job.status) === filter).map((job) => { const progress = progressFor(job); return <tr role="button" aria-label={`${jobLabel(job)} · ${job.status ?? "unknown"}`} key={job.id} className={props.selectedJobId === job.id ? "activity-selected" : ""} onClick={() => props.onSelect(job.id)} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); props.onSelect(job.id); } }}><td><strong>{jobLabel(job)}</strong><small>{shortId(job.id)}</small></td><td><StatusBadge status={job.status ?? "unknown"} compact /></td><td>{progress && isActiveStatus(job.status) ? progress.label : "—"}</td><td>{typeof job.workflow_id === "string" ? "Hub workflow" : "External job"}</td><td>{relativeTime(job.create_time)}</td></tr>; })}</tbody></table>{props.jobs.length === 0 && <div className="column-empty">No jobs on this page match this filter.</div>}</div>}
+		<div className="job-pagination"><span>Showing {props.jobTotal === 0 ? 0 : props.jobPage * props.jobsPerPage + 1}–{Math.min((props.jobPage + 1) * props.jobsPerPage, props.jobTotal)} of {props.jobTotal.toLocaleString()}</span><div><button className="button button-secondary" disabled={props.jobPage === 0 || props.jobsLoading} onClick={() => props.onPageChange(props.jobPage - 1)}>Previous</button><span>Page {props.jobPage + 1} of {Math.max(1, Math.ceil(props.jobTotal / props.jobsPerPage))}</span><button className="button button-secondary" disabled={(props.jobPage + 1) * props.jobsPerPage >= props.jobTotal || props.jobsLoading} onClick={() => props.onPageChange(props.jobPage + 1)}>Next</button></div></div>
 		<div className="cancel-policy"><span className="policy-icon"><Icon name="shield" /></span><p><strong>Safe queue controls.</strong> You can remove a job only while it is pending. The Hub never interrupts a running job.</p></div>
 		{props.jobs.length === 0 && !props.jobsLoading && !props.jobsError && <div className="empty-workspace"><div className="empty-art"><Icon name="spark" /></div><h3>No jobs yet</h3><p>Upload a saved API-format workflow and submit it to see jobs here.</p><button className="button button-primary" onClick={() => props.onNavigate("workflows")}>Open workflows</button></div>}
 		{props.selectedJobId && <JobDetailPanel
@@ -702,8 +698,9 @@ function JobDetailPanel(props: {
 					{props.workflow ? <div className="linked-workflow"><span className="workflow-file-icon"><Icon name="workflow" /></span><div><strong>{props.workflow.name || props.workflow.filename || "Untitled workflow"}</strong><span>{formatBytes(props.workflow.bytes)} · saved {formatDate(props.workflow.createdAt)}</span></div><a className="text-link" href={`/api/v1/workflows/${encodeURIComponent(props.workflow.id)}/content`} download={props.workflow.filename || `${props.workflow.id}.json`}>Original JSON <Icon name="download" /></a></div>
 						: job.workflow_id ? <p className="subtle-copy">Workflow metadata unavailable for this job.</p> : <p className="subtle-copy">No saved Hub workflow is associated; this job was submitted outside the Hub.</p>}
 				</section>
+				{props.assets.some((asset) => asset.origin === "input") && <section className="detail-section"><div className="detail-section-title"><h3>Referenced Hub inputs</h3></div><div className="asset-grid detail-assets">{props.assets.filter((asset) => asset.origin === "input").map((asset) => <AssetCard key={asset.asset_id} asset={asset} onCopied={() => undefined} />)}</div></section>}
 				<section className="detail-section"><div className="detail-section-title"><h3>Outputs</h3><span className={`archive-state ${pendingAssets ? "archive-pending" : readyAssets ? "archive-ready" : ""}`}><span className={`status-dot status-${readyAssets ? "complete" : pendingAssets ? "running" : "neutral"}`} />{archiveLabel}</span>{isUuid(job.id) && <button type="button" className="button button-secondary output-refresh" aria-label="Refresh outputs" aria-busy={props.outputsRefreshing} disabled={props.outputsRefreshing} onClick={props.onRefreshOutputs}>{props.outputsRefreshing ? "Refreshing…" : "Refresh outputs"}</button>}</div>
-					{props.assets.length ? <div className="asset-grid detail-assets">{props.assets.map((asset) => <AssetCard key={asset.asset_id} asset={asset} onCopied={() => undefined} />)}</div> : <div className="subtle-copy output-empty">{isArchiveRetryStatus(job.status) ? "No output assets are recorded yet. Automatic discovery retries are bounded; refresh outputs to check again." : "No output files are available yet."}</div>}
+					{props.assets.some((asset) => asset.origin === "output") ? <div className="asset-grid detail-assets">{props.assets.filter((asset) => asset.origin === "output").map((asset) => <AssetCard key={asset.asset_id} asset={asset} onCopied={() => undefined} />)}</div> : <div className="subtle-copy output-empty">{isArchiveRetryStatus(job.status) ? "No output assets are recorded yet. Automatic discovery retries are bounded; refresh outputs to check again." : "No output files are available yet."}</div>}
 					{job.outputs !== undefined && <details className="raw-details"><summary>ComfyUI output references</summary><pre>{safeJson(job.outputs)}</pre></details>}
 				</section>
 				{(job.execution_error !== undefined || job.submission_error !== undefined) && <section className="detail-section error-section"><div className="detail-section-title"><h3>{job.submission_error !== undefined ? "Submission error" : "Execution error"}</h3><span className="error-label">FAILED</span></div><pre className="error-payload">{safeJson(job.submission_error ?? job.execution_error)}</pre></section>}
@@ -958,9 +955,6 @@ function CatalogPage(props: {
 	detail: Record<string, unknown> | null;
 	onNode: (nodeId: string) => void;
 	onModel: (folder: string, name: string) => void;
-	qwenGuide: Record<string, unknown> | null;
-	guideBusy: boolean;
-	onGuide: () => void;
 }) {
 	return <>
 		<div className="page-heading"><div><div className="eyebrow">READ-ONLY DISCOVERY</div><h1>Know what’s installed.</h1><p>Explore live node schemas and model files from the connected ComfyUI server.</p></div></div>
@@ -981,19 +975,18 @@ function CatalogPage(props: {
 				<div className="catalog-detail-header"><div><div className="eyebrow">DETAILS</div><h2>{props.detailTitle || "Select a result"}</h2></div><span className="read-only-pill"><Icon name="eye" />READ ONLY</span></div>
 				{props.detailTitle && !props.detail && !props.busy && <LoadingState label="Loading full detail…" />}
 				{props.detail && <><p className="catalog-detail-description">{typeof props.detail.description === "string" ? props.detail.description : props.tab === "models" ? "Installed model file and loader choices." : "Full live node schema from ComfyUI object_info."}</p><pre className="schema-view">{safeJson(props.detail)}</pre></>}
-				{!props.detailTitle && !props.qwenGuide && <div className="guide-promo"><div className="guide-icon">Q</div><span className="eyebrow">CURATED FIELD GUIDE</span><h3>Qwen Image 2.1</h3><p>Model files, loader wiring, and settings checked against the shared workflow reference.</p><button className="button button-secondary" onClick={props.onGuide} disabled={props.guideBusy}>{props.guideBusy ? "Loading guide…" : "Open model guide"}<Icon name="arrow" /></button></div>}
-				{props.qwenGuide && <QwenGuide guide={props.qwenGuide} />}
 			</aside>
 		</div>
 	</>;
 }
 
-function QwenGuide({ guide }: { guide: Record<string, unknown> }) {
-	const files = Array.isArray(guide.model_files) ? guide.model_files.filter(isRecord) : [];
-	return <div className="qwen-guide"><div className="guide-icon">Q</div><span className="eyebrow">VERSIONED MODEL GUIDE</span><h3>{String(guide.title || "Qwen Image 2.1")}</h3><p>Reference values are curated from the repository’s saved API workflow. Live install checks are shown per file.</p><div className="guide-status"><span className={`status-dot status-${guide.installation_status === "all_files_installed" ? "complete" : "running"}`} />{String(guide.installation_status || guide.status || "Guide available")}</div>
-		<div className="guide-files">{files.map((file, index) => <div className="guide-file" key={`${String(file.filename)}-${index}`}><span className="guide-file-icon"><Icon name="file" /></span><div><strong>{String(file.filename)}</strong><span>{String(file.role)} · {String(file.expected_folder || "folder not mapped")}</span></div><StatusBadge status={file.installed === true ? "ready" : "not installed"} compact /></div>)}</div>
-		{isRecord(guide.parameters) && <details className="raw-details"><summary>Workflow parameters</summary><pre>{safeJson(guide.parameters)}</pre></details>}
-	</div>;
+function KnowledgePage({ entries, onLoad, onSave, onDelete }: { entries: KnowledgeEntry[]; onLoad: () => Promise<void>; onSave: (entry: {id?: string; title: string; body: string}) => Promise<void>; onDelete: (id: string) => Promise<void> }) {
+	const [id, setId] = useState<string | undefined>(); const [title, setTitle] = useState(""); const [body, setBody] = useState(""); const [error, setError] = useState<string | null>(null);
+	useEffect(() => { void onLoad().catch((reason) => setError(messageOf(reason))); }, []);
+	const reset = () => { setId(undefined); setTitle(""); setBody(""); };
+	return <><div className="page-heading"><div><div className="eyebrow">SHARED NOTES</div><h1>Knowledge board.</h1><p>Simple title-and-body notes, shared through the Hub and MCP.</p></div></div>
+		<div className="knowledge-layout"><form className="knowledge-editor" onSubmit={async (event) => { event.preventDefault(); try { await onSave({ ...(id ? {id} : {}), title, body }); reset(); } catch (reason) { setError(messageOf(reason)); } }}><h2>{id ? "Edit card" : "New card"}</h2><label htmlFor="knowledge-title">Title</label><input id="knowledge-title" required maxLength={200} value={title} onChange={(event) => setTitle(event.currentTarget.value)} /><label htmlFor="knowledge-body">Body</label><textarea id="knowledge-body" rows={8} maxLength={10000} value={body} onChange={(event) => setBody(event.currentTarget.value)} /><div className="modal-actions"><button type="button" className="button button-secondary" onClick={reset}>Clear</button><button className="button button-primary">{id ? "Update" : "Create"}</button></div>{error && <div className="inline-error">{error}</div>}</form>
+			<div className="knowledge-cards">{entries.map((entry) => <article className="knowledge-card" key={entry.id}><h3>{entry.title}</h3><p>{entry.body}</p><small>Updated {formatDate(entry.updatedAt)}</small><div><button className="button button-secondary" onClick={() => { setId(entry.id); setTitle(entry.title); setBody(entry.body); }}>Edit</button><button className="button button-danger" onClick={() => void onDelete(entry.id).catch((reason) => setError(messageOf(reason)))}>Delete</button></div></article>)}{entries.length === 0 && <div className="subtle-copy">No knowledge cards yet.</div>}</div></div></>;
 }
 
 function NavButton({ active, onClick, icon, label, badge }: { active: boolean; onClick: () => void; icon: string; label: string; badge?: number }) {

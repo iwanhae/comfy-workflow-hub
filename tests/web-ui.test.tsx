@@ -42,7 +42,7 @@ Object.defineProperty(globalThis, "EventSource", { configurable: true, value: Fa
 
 const originalFetch = globalThis.fetch;
 
-const { act, cleanup, fireEvent, render, screen, waitFor, within } = await import("@testing-library/react");
+const { act, cleanup, fireEvent, render, screen, waitFor } = await import("@testing-library/react");
 const { default: App } = await import("../web/src/App.tsx");
 
 const pendingId = "11111111-1111-4111-8111-111111111111";
@@ -427,7 +427,7 @@ describe("shared hub browser flows", () => {
 		}
 	});
 
-	test("routes unknown and queued jobs to Queue and running jobs to Running", async () => {
+	test("lists jobs newest-first in the activity table and filters statuses", async () => {
 		setFetch((url, init) => {
 			const common = sharedReads(url);
 			if (common) return common;
@@ -440,12 +440,44 @@ describe("shared hub browser flows", () => {
 		});
 		render(<App />);
 		await screen.findByRole("button", { name: /External ComfyUI job · unknown/ });
-		const queue = screen.getByRole("region", { name: "Queue" });
-		const running = screen.getByRole("region", { name: "Running" });
-		expect(within(queue).getByRole("button", { name: /External ComfyUI job · unknown/ })).toBeTruthy();
-		expect(within(queue).getByRole("button", { name: /External ComfyUI job · queued/ })).toBeTruthy();
-		expect(within(running).getByRole("button", { name: /External ComfyUI job · running/ })).toBeTruthy();
-		expect(screen.getByText("No completed jobs")).toBeTruthy();
+		const rows = screen.getAllByRole("button", { name: /External ComfyUI job/ });
+		expect(rows.map((row) => row.getAttribute("aria-label"))).toEqual([
+			"External ComfyUI job · unknown", "External ComfyUI job · queued", "External ComfyUI job · running",
+		]);
+		fireEvent.click(screen.getByRole("button", { name: /^Queue/ }));
+		expect(screen.getByRole("button", { name: /External ComfyUI job · queued/ })).toBeTruthy();
+		expect(screen.queryByRole("button", { name: /External ComfyUI job · running/ })).toBeNull();
+	});
+
+	test("pages server-side in 100-job slices and keeps SSE updates on the visible page", async () => {
+		const offsets: number[] = [];
+		setFetch((url, init) => {
+			const common = sharedReads(url);
+			if (common) return common;
+			if (url.pathname === "/api/v1/jobs" && init?.method !== "POST") {
+				const offset = Number(url.searchParams.get("offset") ?? 0);
+				offsets.push(offset);
+				const total = 205;
+				const jobs = Array.from({ length: Math.max(0, Math.min(100, total - offset)) }, (_, index) => ({
+					id: `job-${offset + index}`, status: "completed", create_time: total - offset - index,
+				}));
+				return response({ jobs, pagination: { total, offset, has_more: offset + jobs.length < total } });
+			}
+			throw new Error(`Unexpected test request: ${init?.method ?? "GET"} ${url.pathname}`);
+		});
+		render(<App />);
+		await screen.findByText("job-0");
+		expect(offsets).toContain(0);
+		expect(screen.getByText("Showing 1–100 of 205")).toBeTruthy();
+		const source = FakeEventSource.instances[0]!;
+		act(() => source.dispatch("job", { sequence: 1, job: { job_id: "job-101", status: "failed", updated_at: new Date().toISOString() } }));
+		expect(screen.queryByText("job-101")).toBeNull();
+		fireEvent.click(screen.getByRole("button", { name: "Next" }));
+		await screen.findByText("Showing 101–200 of 205");
+		expect(offsets).toContain(100);
+		expect(screen.getByText("job-101")).toBeTruthy();
+		act(() => source.dispatch("job", { sequence: 2, job: { job_id: "job-0", status: "failed", updated_at: new Date().toISOString() } }));
+		expect(screen.queryByText("job-0")).toBeNull();
 	});
 
 	test("requires an original image for mask uploads and displays the copy-ready workflow value", async () => {

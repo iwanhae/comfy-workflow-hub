@@ -1,15 +1,8 @@
 import type { ComfyApiClient } from "./comfy-client.ts";
 import { ComfyUpstreamError, HttpError } from "./errors.ts";
-import { MODEL_GUIDE_VERSION, MODEL_GUIDES } from "./model-guides.ts";
 
 const CACHE_TTL_MS = 15_000;
 const MAX_MODEL_FOLDERS = 128;
-const LOADER_MODEL_FOLDERS: Record<string, { input: string; folder: string }> = {
-	UNETLoader: { input: "unet_name", folder: "diffusion_models" },
-	CLIPLoader: { input: "clip_name", folder: "text_encoders" },
-	VAELoader: { input: "vae_name", folder: "vae" },
-};
-
 type JsonRecord = Record<string, unknown>;
 type NodeMap = Record<string, JsonRecord>;
 
@@ -90,55 +83,6 @@ export class ComfyDiscovery {
 		const nodes = await this.getNodes();
 		const loaders = findLoaderChoices(nodes, name);
 		return { folder, name, installed: true, loaders };
-	}
-
-	async modelGuide(model: string): Promise<Record<string, unknown>> {
-		const normalized = normalizedText(model).replace(/[^a-z0-9]+/g, "");
-		const guide = MODEL_GUIDES.find((candidate) =>
-			[candidate.id, candidate.title, ...candidate.aliases]
-				.some((alias) => normalizedText(alias).replace(/[^a-z0-9]+/g, "") === normalized),
-		);
-		if (!guide) {
-			return {
-				guide_version: MODEL_GUIDE_VERSION,
-				status: "not_available",
-				model,
-				message: "No curated guide is available for this model. No recommendations were inferred.",
-			};
-		}
-
-		const [installedModels, nodes] = await Promise.all([this.getAllModels(), this.getNodes()]);
-		const modelFiles = guide.model_files.map((file) => {
-			const expectedFolder = expectedModelFolder(file.loader_node, file.loader_input);
-			const folderMatch = expectedFolder === null
-				? undefined
-				: installedModels.find((modelFile) => modelFile.folder === expectedFolder && modelFile.name === file.filename);
-			const loaderEvidence = loaderChoiceEvidence(nodes, file.loader_node, file.loader_input, file.filename);
-			const otherFolders = installedModels
-				.filter((modelFile) => modelFile.name === file.filename && modelFile.folder !== expectedFolder)
-				.map((modelFile) => modelFile.folder);
-			const installed = expectedFolder !== null
-				&& loaderEvidence.schemaAvailable
-				&& folderMatch !== undefined
-				&& loaderEvidence.choiceMatches !== false;
-			return {
-				...file,
-				expected_folder: expectedFolder,
-				loader_schema_available: loaderEvidence.schemaAvailable,
-				loader_choice_match: loaderEvidence.choiceMatches,
-				folder_match: folderMatch !== undefined,
-				installed,
-				installed_folder: folderMatch?.folder ?? null,
-				found_in_other_folders: otherFolders,
-			};
-		});
-		return {
-			guide_version: MODEL_GUIDE_VERSION,
-			status: "available",
-			installation_status: modelFiles.every((file) => file.installed) ? "all_files_installed" : "some_files_not_verified_installed",
-			...guide,
-			model_files: modelFiles,
-		};
 	}
 
 	async getNodesSnapshot(): Promise<NodeMap> {
@@ -245,29 +189,6 @@ function findLoaderChoices(nodes: NodeMap, modelName: string): Array<Record<stri
 function optionList(definition: unknown): string[] | null {
 	if (!Array.isArray(definition) || !Array.isArray(definition[0])) return null;
 	return definition[0].filter((value): value is string => typeof value === "string");
-}
-
-function expectedModelFolder(loaderNode: string, loaderInput: string): string | null {
-	const loader = LOADER_MODEL_FOLDERS[loaderNode];
-	return loader?.input === loaderInput ? loader.folder : null;
-}
-
-function loaderChoiceEvidence(
-	nodes: NodeMap,
-	loaderNode: string,
-	loaderInput: string,
-	modelName: string,
-): { schemaAvailable: boolean; choiceMatches: boolean | null } {
-	const schema = nodes[loaderNode];
-	if (!schema) return { schemaAvailable: false, choiceMatches: null };
-	const input = isRecord(schema.input) ? schema.input : {};
-	for (const section of ["required", "optional"] as const) {
-		const sectionInputs = isRecord(input[section]) ? input[section] as JsonRecord : {};
-		if (!(loaderInput in sectionInputs)) continue;
-		const choices = optionList(sectionInputs[loaderInput]);
-		return { schemaAvailable: true, choiceMatches: choices === null ? null : choices.includes(modelName) };
-	}
-	return { schemaAvailable: false, choiceMatches: null };
 }
 
 function modelFolderNames(value: unknown): string[] {

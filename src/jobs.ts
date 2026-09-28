@@ -72,6 +72,7 @@ export class JobService {
 		if (attempt.reused) return this.resultFromAttempt(attempt.submission, true);
 
 		const { submission } = attempt;
+		this.store.associateJobInputAssets(submission.promptId, workflow);
 		let attemptPromptId = submission.promptId;
 		const extraData = { comfy_hub_workflow_id: submission.workflowId };
 		try {
@@ -170,7 +171,7 @@ export class JobService {
 			jobs.push(local);
 		}
 
-		jobs.sort((a, b) => numericField(b, "create_time") - numericField(a, "create_time"));
+		jobs.sort((a, b) => numericField(b, "create_time") - numericField(a, "create_time") || a.id.localeCompare(b.id));
 		return jobs;
 	}
 
@@ -428,6 +429,7 @@ function rejectedError(promptId: string, workflowId: string, message: string, pa
 function addLocalMapping(job: ComfyJob, submission: JobSubmission): ComfyJob {
 	return {
 		...job,
+		create_time: submission.createdAt,
 		workflow_id: submission.workflowId,
 		local_submission_state: submission.state,
 	};

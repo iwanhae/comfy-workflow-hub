@@ -46,7 +46,8 @@ committed to the immutable workflow library. The UI submits only a stored
 select an image or mask file locally; masks are tied to a ready original image.
 The returned `workflow_value` is displayed for copying into a locally edited
 API-format workflow—the Hub never modifies stored workflow JSON. Node/model
-search and full detail plus the Qwen Image 2.1 guide are read-only.
+search and full detail are read-only; a separate knowledge board stores shared
+title/body notes.
 
 The hub listens on `127.0.0.1:3000` by default. Persistent state is kept in
 `./data/` and is ignored by git. SQLite uses WAL mode; workflow bytes live in
@@ -181,22 +182,19 @@ untrusted network.
 The MCP server advertises exactly these tools:
 
 ```text
-node_list, node_get, model_list, model_get, model_guide,
+node_list, node_get, model_list, model_get,
 workflow_upload, workflow_list, workflow_get,
 job_submit, job_list, job_get, job_wait, job_cancel,
-asset_upload, asset_list, asset_get, server_get
+asset_upload, asset_list, asset_get,
+knowledge_list, knowledge_get, knowledge_set, knowledge_delete, server_get
 ```
 
 Node/model discovery reads the connected ComfyUI's live `/object_info` and
 `/models/{folder}` catalogs. Lists are searched and paginated; full node schemas
 and installed-model loader choices are available through detail tools. Catalog
-responses are shared with REST and cached briefly (15 seconds). `model_guide`
-is a versioned curated record (`src/model-guides.ts`, version `1.0.0`) sourced
-only from `workflows/t2i.json`: it reports the declared Qwen Image 2.1
-diffusion-model, encoder, VAE, wiring, and workflow parameters, then checks each
-file against its expected model folder and live loader choice. A same-named file
-in another folder is reported but is not marked installed. Unknown models return
-`status: "not_available"`; no recommendations are inferred.
+responses are shared with REST and cached briefly (15 seconds). The knowledge
+board stores plain title/body cards in the Hub SQLite database. `knowledge_set`
+creates a card when `id` is omitted and updates the identified card otherwise.
 
 MCP tools do not have access to a remote client's local filesystem. To upload a
 workflow or image, first send its bytes out-of-band to `POST /api/v1/uploads`
@@ -216,7 +214,7 @@ curl 'http://127.0.0.1:3000/api/v1/comfy/nodes/search?q=sampler&limit=20'
 curl http://127.0.0.1:3000/api/v1/comfy/nodes/KSampler
 curl 'http://127.0.0.1:3000/api/v1/comfy/models/search?q=qwen&limit=20'
 curl http://127.0.0.1:3000/api/v1/comfy/models/diffusion_models/qwen_image_2.1_int8_convrot.safetensors
-curl http://127.0.0.1:3000/api/v1/comfy/model-guide/qwen-image-2.1
+curl http://127.0.0.1:3000/api/v1/knowledge
 ```
 
 Job submission creates a canonical UUID and persists the attempt in SQLite
